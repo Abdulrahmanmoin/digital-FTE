@@ -1,0 +1,62 @@
+# Sensitive credentials and secrets - ENTIRE FOLDER
+credentials/
+.env
+.env.*
+.mcp.json
+
+# API keys and tokens
+*.pem
+*.key
+*.cert
+*.p12
+
+# User-specific configuration (may contain sensitive data)
+credentials/x_keywords.json
+credentials/x_watchlist.json
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+venv/
+env/
+ENV/
+.venv
+
+# Node.js (for PM2)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Playwright
+.playwright/
+playwright/.auth/
+
+# Temporary files
+*.tmp
+*.bak
+*.old
