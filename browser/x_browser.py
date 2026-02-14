@@ -217,14 +217,100 @@ def parse_tweets_from_page(page: Page) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Following list parsing
+# ---------------------------------------------------------------------------
+
+def parse_following_from_page(page: Page, max_scrolls: int = 20) -> list[dict]:
+    """Scroll through a /following page and extract all followed accounts.
+
+    Scrolls up to max_scrolls times, stopping early when no new accounts
+    appear (i.e. the bottom of the list has been reached).
+
+    Returns a list of dicts with keys: username, display_name.
+    """
+    try:
+        page.wait_for_selector('[data-testid="UserCell"]', timeout=15_000)
+    except Exception:
+        logger.warning("No UserCell elements found on following page.")
+        return []
+
+    seen: dict[str, str] = {}  # username -> display_name
+
+    def _extract_current():
+        return page.evaluate("""() => {
+            const cells = document.querySelectorAll('[data-testid="UserCell"]');
+            const results = [];
+            for (const cell of cells) {
+                try {
+                    let username = '';
+                    let displayName = '';
+                    const links = cell.querySelectorAll('a[href]');
+                    for (const link of links) {
+                        const href = link.getAttribute('href') || '';
+                        // Profile links are exactly /username (no sub-paths)
+                        if (/^\\/[A-Za-z0-9_]+$/.test(href)) {
+                            username = href.slice(1);
+                            // Display name: first non-empty, non-@ span inside that link
+                            const spans = link.querySelectorAll('span');
+                            for (const s of spans) {
+                                const t = s.innerText.trim();
+                                if (t && !t.startsWith('@')) {
+                                    displayName = t;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (username) results.push({ username, display_name: displayName });
+                } catch (e) {}
+            }
+            return results;
+        }""")
+
+    for scroll_num in range(max_scrolls):
+        batch = _extract_current() or []
+        new_found = 0
+        for entry in batch:
+            u = entry.get("username", "").lower()
+            if u and u not in seen:
+                seen[u] = entry.get("display_name", "")
+                new_found += 1
+
+        logger.debug(
+            "Following scroll %d/%d — %d new accounts, %d total",
+            scroll_num + 1, max_scrolls, new_found, len(seen),
+        )
+
+        # Reached the bottom — no new accounts loaded
+        if scroll_num > 0 and new_found == 0:
+            logger.debug("No new accounts after scroll — reached end of following list.")
+            break
+
+        # Scroll to bottom and wait for lazy-load
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(2.5)
+
+    results = [
+        {"username": username, "display_name": display_name}
+        for username, display_name in seen.items()
+    ]
+    logger.info("Parsed %d accounts from following page.", len(results))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # URL helpers
 # ---------------------------------------------------------------------------
 
-def build_search_url(keyword: str) -> str:
-    """Build an X search URL for a keyword (Latest tab, excluding retweets)."""
-    query = f"{keyword} -filter:retweets"
-    encoded = urllib.parse.quote(query)
-    return f"https://x.com/search?q={encoded}&src=typed_query&f=live"
+def build_following_url(username: str) -> str:
+    """Build the following page URL for a given username."""
+    return f"https://x.com/{username}/following"
+
+
+def build_profile_url(username: str) -> str:
+    """Build the profile page URL for a given username."""
+    return f"https://x.com/{username}"
 
 
 def build_mentions_url(username: str) -> str:

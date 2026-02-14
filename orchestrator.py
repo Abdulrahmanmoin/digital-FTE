@@ -27,6 +27,7 @@ Assumptions:
 """
 
 import concurrent.futures
+import json
 import logging
 import os
 import re
@@ -35,12 +36,16 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
 
 from browser.x_actions import execute_tweet_actions as browser_execute_tweet_actions
+from browser.linkedin_actions import (
+    execute_linkedin_actions as browser_execute_linkedin_actions,
+    execute_linkedin_post as browser_execute_linkedin_post,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -60,8 +65,26 @@ MAX_REASONING_PER_CYCLE = 3  # max Claude Code calls before checking Approved/
 BROWSER_ACTION_TIMEOUT = 90  # seconds before killing a hung browser action
 CLAUDE_CMD = "claude"  # Claude Code CLI command
 
+# LinkedIn rate limits
+LINKEDIN_DAILY_ACTION_LIMIT = 5    # max like+comment actions per 24h window
+LINKEDIN_POST_INTERVAL_HOURS = 1   # generate a new post draft every N hours
+
+# X/Twitter rate limits
+X_DAILY_ACTION_LIMIT = 5           # max reply/like/retweet actions per 24h window
+
+CREDENTIALS_DIR = BASE_DIR / "credentials"
+LINKEDIN_DAILY_ACTIONS_PATH = CREDENTIALS_DIR / ".linkedin_daily_actions.json"
+LINKEDIN_LAST_POST_PATH = CREDENTIALS_DIR / ".linkedin_last_post.json"
+X_DAILY_ACTIONS_PATH = CREDENTIALS_DIR / ".x_daily_actions.json"
+
+# Dedicated working directory for all orchestrator-triggered Claude invocations.
+# Claude Code scopes conversation history by cwd, so using a subdirectory here
+# keeps orchestrator sessions isolated from the developer's /resume history.
+ORCHESTRATOR_WORKSPACE_DIR = BASE_DIR / "orchestrator_workspace"
+
 # Ensure all directories exist
-for d in [NEEDS_ACTION_DIR, PLANS_DIR, PENDING_APPROVAL_DIR, APPROVED_DIR, DONE_DIR]:
+for d in [NEEDS_ACTION_DIR, PLANS_DIR, PENDING_APPROVAL_DIR, APPROVED_DIR, DONE_DIR,
+          ORCHESTRATOR_WORKSPACE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -90,13 +113,158 @@ logger = logging.getLogger("orchestrator")
 # ---------------------------------------------------------------------------
 
 _running = True
-_known_approved: set[str] = set()
 
 
 def _shutdown(signum, frame):
     global _running
     logger.info("Shutdown signal received (signal %s). Stopping orchestrator...", signum)
     _running = False
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn daily action quota (like + comment combined, max 5/24h)
+# ---------------------------------------------------------------------------
+
+def _load_linkedin_action_quota() -> tuple[int, datetime]:
+    """Load the LinkedIn action count and window start from disk."""
+    if LINKEDIN_DAILY_ACTIONS_PATH.exists():
+        try:
+            data = json.loads(LINKEDIN_DAILY_ACTIONS_PATH.read_text(encoding="utf-8"))
+            count = data.get("actions_today", 0)
+            window_start = datetime.fromisoformat(
+                data.get("window_start_time", datetime.now().isoformat())
+            )
+            return count, window_start
+        except Exception:
+            logger.exception("Failed to load LinkedIn action quota; resetting.")
+    return 0, datetime.now()
+
+
+def _save_linkedin_action_quota(count: int, window_start: datetime):
+    """Persist the LinkedIn action quota to disk."""
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    LINKEDIN_DAILY_ACTIONS_PATH.write_text(
+        json.dumps({"actions_today": count, "window_start_time": window_start.isoformat()}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _linkedin_actions_remaining() -> int:
+    """Return remaining LinkedIn action slots for the current 24h window."""
+    count, window_start = _load_linkedin_action_quota()
+    # Reset window if 24h has elapsed
+    if datetime.now() - window_start >= timedelta(hours=24):
+        logger.info("LinkedIn action quota window expired — resetting.")
+        _save_linkedin_action_quota(0, datetime.now())
+        return LINKEDIN_DAILY_ACTION_LIMIT
+    remaining = LINKEDIN_DAILY_ACTION_LIMIT - count
+    return max(0, remaining)
+
+
+def _increment_linkedin_action_count():
+    """Record that one LinkedIn like/comment action was executed."""
+    count, window_start = _load_linkedin_action_quota()
+    # Reset if window has expired
+    if datetime.now() - window_start >= timedelta(hours=24):
+        count = 0
+        window_start = datetime.now()
+    count += 1
+    _save_linkedin_action_quota(count, window_start)
+    logger.info(
+        "LinkedIn action quota: %d/%d used in this 24h window.",
+        count, LINKEDIN_DAILY_ACTION_LIMIT,
+    )
+
+
+# ---------------------------------------------------------------------------
+# X/Twitter daily action quota (reply + like + retweet combined, max 5/24h)
+# ---------------------------------------------------------------------------
+
+def _load_x_action_quota() -> tuple[int, datetime]:
+    """Load the X action count and window start from disk."""
+    if X_DAILY_ACTIONS_PATH.exists():
+        try:
+            data = json.loads(X_DAILY_ACTIONS_PATH.read_text(encoding="utf-8"))
+            count = data.get("actions_today", 0)
+            window_start = datetime.fromisoformat(
+                data.get("window_start_time", datetime.now().isoformat())
+            )
+            return count, window_start
+        except Exception:
+            logger.exception("Failed to load X action quota; resetting.")
+    return 0, datetime.now()
+
+
+def _save_x_action_quota(count: int, window_start: datetime):
+    """Persist the X action quota to disk."""
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    X_DAILY_ACTIONS_PATH.write_text(
+        json.dumps({"actions_today": count, "window_start_time": window_start.isoformat()}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _x_actions_remaining() -> int:
+    """Return remaining X action slots for the current 24h window."""
+    count, window_start = _load_x_action_quota()
+    if datetime.now() - window_start >= timedelta(hours=24):
+        logger.info("X action quota window expired — resetting.")
+        _save_x_action_quota(0, datetime.now())
+        return X_DAILY_ACTION_LIMIT
+    remaining = X_DAILY_ACTION_LIMIT - count
+    return max(0, remaining)
+
+
+def _increment_x_action_count():
+    """Record that one X reply/like/retweet action batch was executed."""
+    count, window_start = _load_x_action_quota()
+    if datetime.now() - window_start >= timedelta(hours=24):
+        count = 0
+        window_start = datetime.now()
+    count += 1
+    _save_x_action_quota(count, window_start)
+    logger.info(
+        "X action quota: %d/%d used in this 24h window.",
+        count, X_DAILY_ACTION_LIMIT,
+    )
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn post scheduling (one drafted post per hour)
+# ---------------------------------------------------------------------------
+
+def _load_last_linkedin_post_time() -> datetime:
+    """Return the datetime of the last LinkedIn post draft, or epoch if never."""
+    if LINKEDIN_LAST_POST_PATH.exists():
+        try:
+            data = json.loads(LINKEDIN_LAST_POST_PATH.read_text(encoding="utf-8"))
+            return datetime.fromisoformat(data.get("last_scheduled_at", "1970-01-01T00:00:00"))
+        except Exception:
+            pass
+    return datetime(1970, 1, 1)
+
+
+def _save_last_linkedin_post_time():
+    """Persist the current time as the last LinkedIn post schedule time."""
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    LINKEDIN_LAST_POST_PATH.write_text(
+        json.dumps({"last_scheduled_at": datetime.now().isoformat()}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _schedule_linkedin_post_if_due():
+    """Draft a new LinkedIn post for human review if the hourly interval has elapsed."""
+    last = _load_last_linkedin_post_time()
+    if datetime.now() - last < timedelta(hours=LINKEDIN_POST_INTERVAL_HOURS):
+        return  # not yet time
+
+    logger.info(
+        "LinkedIn post interval elapsed (%.1fh since last draft) — scheduling new post draft.",
+        (datetime.now() - last).total_seconds() / 3600,
+    )
+    _trigger_claude_linkedin_post_draft()
+    _save_last_linkedin_post_time()
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +435,138 @@ IMPORTANT RULES:
     _invoke_claude_reasoning(task_file, prompt)
 
 
+def _trigger_claude_linkedin_reasoning(task_file: Path):
+    """
+    Invoke Claude Code CLI to reason about a LinkedIn post task file.
+
+    Claude is responsible for:
+    - Reading the LinkedIn post task file
+    - Deciding which actions to take (like, comment, ignore)
+    - Creating a plan file in /Plans
+    - Creating an approval file in /Pending_Approval with proposed actions
+    """
+    prompt = f"""You are an AI LinkedIn Engagement Assistant for the user with LinkedIn username 'arm-test',
+a software engineer focused on coding, AI, web development, and personal brand building.
+
+STEP 1: Read the LinkedIn post task file at this exact path:
+  {task_file}
+
+STEP 2: Analyze the post and decide which engagement actions are appropriate.
+Consider:
+- Is this post relevant to our brand (coding, AI, web dev, agentic systems, tech)?
+- Is the author someone worth engaging with professionally?
+- Would commenting add genuine value to the conversation?
+- Is the tone appropriate for professional engagement on LinkedIn?
+
+Possible actions (pick one or more, or "ignore"):
+- "like" — Show appreciation (use for relevant, positive posts)
+- "comment" — Engage in conversation (primary value action)
+- "ignore" — Skip engagement (spam, irrelevant, or off-topic content)
+
+STEP 3: Create a plan file at this exact path:
+  {PLANS_DIR / ('PLAN_' + task_file.name)}
+
+The plan file should contain:
+- Summary of the post
+- Why you chose these actions
+- Your reasoning for the comment content (if commenting)
+
+STEP 4: Create an approval file at this exact path:
+  {PENDING_APPROVAL_DIR / ('ACTION_LINKEDIN_' + task_file.name)}
+
+The approval file MUST use this EXACT format:
+
+---
+type: linkedin_action
+actions: ["list", "of", "actions"]
+post_id: "<post_id from the task file>"
+post_urn: "<post_urn from the task file>"
+author_username: "<author_username from the task file>"
+source_task: "{task_file.name}"
+status: pending_approval
+---
+
+# Original LinkedIn Post
+
+**Author:** <author name> (@<username>)
+**Post ID:** <id>
+**URN:** <urn>
+**Created:** <timestamp>
+
+<paste the full post content here>
+
+# Proposed Actions
+
+## Action 1: <action type>
+<For "comment" actions, write the full comment text here. Keep it professional, insightful,
+and concise (under 1000 characters). Match the tone of LinkedIn — be genuinely helpful
+and add value to the conversation.
+For "like", just note "Will like this post.">
+
+IMPORTANT RULES:
+- You MUST create both files (plan + approval) by writing them to disk.
+- For comments, write naturally and professionally. Be helpful and technically engaged
+  where appropriate. No generic platitudes or corporate-speak.
+- Do NOT post any content yourself. Only create the files.
+- Do NOT modify or delete any existing files.
+- If the post is spam, irrelevant, or off-topic, create the plan file explaining why
+  you're ignoring it, but skip creating the approval file.
+"""
+
+    _invoke_claude_reasoning(task_file, prompt)
+
+
+def _trigger_claude_linkedin_post_draft():
+    """Invoke Claude Code CLI to draft an original LinkedIn post for human review.
+
+    Writes directly to Pending_Approval/ (no Needs_Action task file needed —
+    the trigger is time-based, not inbox-based).
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    approval_filename = f"ACTION_LINKEDIN_POST_{timestamp}.md"
+    approval_path = PENDING_APPROVAL_DIR / approval_filename
+
+    prompt = f"""You are an AI LinkedIn Content Creator for the user 'arm-test', a software engineer
+focused on coding, AI, web development, and agentic systems.
+
+Your task is to draft ONE original LinkedIn post for human review and approval.
+This post will be reviewed before being published — do NOT publish anything yourself.
+
+Create an approval file at this exact path:
+  {approval_path}
+
+The approval file MUST use this EXACT format (including the YAML frontmatter):
+
+---
+type: linkedin_post_action
+source_task: "scheduled_post"
+status: pending_approval
+---
+
+# Proposed LinkedIn Post
+
+<Write a professional, engaging LinkedIn post here. The post should:
+- Open with a compelling hook (first line is critical on LinkedIn)
+- Be about a relevant tech topic: AI agents, coding, web dev, developer tools,
+  agentic systems, Python, productivity, or personal brand building
+- Be 150-300 words
+- Share genuine insight, a practical tip, or a lesson learned
+- End with a question or call to action to encourage engagement
+- Use LinkedIn formatting: short paragraphs, line breaks — no markdown headers
+- Feel authentic and personal, not corporate or generic>
+
+IMPORTANT RULES:
+- Create ONLY this one file — nothing else.
+- Do NOT read any other files.
+- Do NOT post or send anything.
+- Write the post content directly after the "# Proposed LinkedIn Post" heading.
+"""
+
+    logger.info("Drafting scheduled LinkedIn post → %s", approval_filename)
+    # Re-use _invoke_claude_reasoning with the approval path as the task identifier
+    _invoke_claude_reasoning(approval_path, prompt)
+
+
 def _kill_process_tree(pid: int):
     """Kill a process and all its children on Windows (or POSIX fallback)."""
     try:
@@ -303,7 +603,7 @@ def _invoke_claude_reasoning(task_file: Path, prompt: str):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=str(BASE_DIR),
+            cwd=str(ORCHESTRATOR_WORKSPACE_DIR),
         )
         stdout, stderr = proc.communicate(input=prompt, timeout=timeout_secs)
         elapsed = int(time.time() - start_time)
@@ -401,7 +701,7 @@ RULES:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=str(BASE_DIR),
+            cwd=str(ORCHESTRATOR_WORKSPACE_DIR),
         )
         stdout, stderr = proc.communicate(input=send_prompt, timeout=120)
 
@@ -524,6 +824,143 @@ def _execute_tweet_actions(approved_file: Path, meta: dict) -> bool:
     return overall_success
 
 
+def _execute_linkedin_actions(approved_file: Path, meta: dict) -> bool:
+    """Execute approved LinkedIn actions via Playwright browser automation.
+
+    Actions supported: like, comment.
+    Comment failures are critical; like failures are logged as warnings.
+    """
+    actions = meta.get("actions", [])
+    post_urn = meta.get("post_urn", "")
+    post_id = meta.get("post_id", "")
+    author_username = meta.get("author_username", "")
+
+    # Resolve URN: if post_urn not set, build from post_id
+    if not post_urn and post_id:
+        post_urn = f"urn:li:activity:{post_id}"
+
+    if not post_urn:
+        logger.error("Approved LinkedIn action missing 'post_urn'/'post_id': %s", approved_file)
+        return False
+
+    if not actions:
+        logger.warning("No actions listed in %s. Nothing to execute.", approved_file)
+        return True
+
+    # Extract comment text from the approval file if commenting
+    comment_text = ""
+    if "comment" in actions:
+        text = approved_file.read_text(encoding="utf-8")
+        comment_match = re.search(
+            r"##\s*Action\s*\d+:\s*[Cc]omment\s*\n(.*?)(?:\n##|\n---|\Z)",
+            text,
+            re.DOTALL,
+        )
+        if comment_match:
+            comment_text = comment_match.group(1).strip()
+            comment_text = re.sub(r"^#+\s+.*$", "", comment_text, flags=re.MULTILINE).strip()
+
+        if not comment_text:
+            logger.error("Comment action requested but no comment text found in %s", approved_file)
+            actions = [a for a in actions if a != "comment"]
+
+    logger.info(
+        "Executing LinkedIn actions via browser: %s for post %s by @%s",
+        actions, post_urn, author_username,
+    )
+
+    try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            browser_execute_linkedin_actions,
+            post_urn=post_urn,
+            author_username=author_username,
+            actions=actions,
+            comment_text=comment_text,
+        )
+        try:
+            results = future.result(timeout=BROWSER_ACTION_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "Browser action timed out after %ds for LinkedIn post %s — skipping",
+                BROWSER_ACTION_TIMEOUT,
+                post_urn,
+            )
+            results = {a: False for a in actions}
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        logger.exception("Browser action execution failed for LinkedIn post %s", post_urn)
+        results = {a: False for a in actions}
+
+    # Write audit log
+    audit_path = LOG_DIR / f"browser_linkedin_{approved_file.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    audit_path.write_text(
+        f"POST_URN: {post_urn}\nAUTHOR: @{author_username}\n"
+        f"ACTIONS: {actions}\nRESULTS: {results}\n",
+        encoding="utf-8",
+    )
+
+    # like failure = warning; comment failure = critical
+    overall_success = True
+    for action_name, success in results.items():
+        if not success:
+            if action_name == "like":
+                logger.warning("Non-critical action 'like' failed for LinkedIn post %s", post_urn)
+            else:
+                logger.error("Action '%s' failed for LinkedIn post %s", action_name, post_urn)
+                overall_success = False
+
+    return overall_success
+
+
+def _execute_linkedin_post_action(approved_file: Path, meta: dict) -> bool:
+    """Post an original LinkedIn post from a human-approved scheduled draft."""
+    text = approved_file.read_text(encoding="utf-8")
+    post_match = re.search(
+        r"#\s*Proposed LinkedIn Post\s*\n(.*?)(?:\n#|\Z)",
+        text,
+        re.DOTALL,
+    )
+    if not post_match:
+        logger.error("No '# Proposed LinkedIn Post' section found in %s", approved_file)
+        return False
+
+    content = post_match.group(1).strip()
+    # Strip any markdown headings that Claude may have accidentally added
+    content = re.sub(r"^#+\s+.*$", "", content, flags=re.MULTILINE).strip()
+
+    if not content:
+        logger.error("Empty post content in %s", approved_file)
+        return False
+
+    logger.info("Executing LinkedIn post from %s (%d chars)", approved_file.name, len(content))
+
+    try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(browser_execute_linkedin_post, content)
+        try:
+            success = future.result(timeout=BROWSER_ACTION_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "LinkedIn post timed out after %ds for %s", BROWSER_ACTION_TIMEOUT, approved_file.name
+            )
+            success = False
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        logger.exception("Error posting LinkedIn content from %s", approved_file.name)
+        success = False
+
+    audit_path = LOG_DIR / f"linkedin_post_{approved_file.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    audit_path.write_text(
+        f"FILE: {approved_file.name}\nCONTENT_LEN: {len(content)}\nSUCCESS: {success}\n\n{content}\n",
+        encoding="utf-8",
+    )
+
+    return success
+
+
 def _execute_approved_action(approved_file: Path):
     """Parse and execute an approved action file, then move it to Done/."""
     meta = _parse_frontmatter(approved_file)
@@ -542,7 +979,29 @@ def _execute_approved_action(approved_file: Path):
     if action_type == "email_action" and action in ("send_reply", "send_email"):
         success = _execute_send_email(approved_file, meta)
     elif action_type == "tweet_action":
+        remaining = _x_actions_remaining()
+        if remaining <= 0:
+            logger.info(
+                "X daily action limit reached (%d/%d) — leaving %s in Approved/ until tomorrow.",
+                X_DAILY_ACTION_LIMIT, X_DAILY_ACTION_LIMIT, approved_file.name,
+            )
+            return  # Leave file in place; do NOT move to Done
         success = _execute_tweet_actions(approved_file, meta)
+        if success:
+            _increment_x_action_count()
+    elif action_type == "linkedin_action":
+        remaining = _linkedin_actions_remaining()
+        if remaining <= 0:
+            logger.info(
+                "LinkedIn daily action limit reached (%d/%d) — leaving %s in Approved/ until tomorrow.",
+                LINKEDIN_DAILY_ACTION_LIMIT, LINKEDIN_DAILY_ACTION_LIMIT, approved_file.name,
+            )
+            return  # Leave file in place; do NOT move to Done
+        success = _execute_linkedin_actions(approved_file, meta)
+        if success:
+            _increment_linkedin_action_count()
+    elif action_type == "linkedin_post_action":
+        success = _execute_linkedin_post_action(approved_file, meta)
     else:
         logger.warning(
             "Unknown action type '%s/%s' in %s. Moving to Done/ as unhandled.",
@@ -616,8 +1075,10 @@ def _scan_needs_action():
         task_type = meta.get("type", "email")  # default to email for backwards compat
 
         # Determine approval file prefix based on task type
-        if task_type == "tweet":
+        if task_type in ("tweet", "watchlist"):
             approval_prefix = "ACTION_TWEET_"
+        elif task_type == "linkedin_post":
+            approval_prefix = "ACTION_LINKEDIN_"
         else:
             approval_prefix = "REPLY_"
 
@@ -635,8 +1096,10 @@ def _scan_needs_action():
         logger.info("[%d/%d] Processing %s task: %s", idx, total, task_type, filename)
 
         try:
-            if task_type == "tweet":
+            if task_type in ("tweet", "watchlist"):
                 _trigger_claude_tweet_reasoning(filepath)
+            elif task_type == "linkedin_post":
+                _trigger_claude_linkedin_reasoning(filepath)
             else:
                 _trigger_claude_reasoning(filepath)
         except Exception:
@@ -665,18 +1128,21 @@ def _scan_needs_action():
 
 
 def _scan_approved():
-    """Detect new files in Approved/ and execute the approved actions."""
-    global _known_approved
-    current_files = {f.name for f in APPROVED_DIR.iterdir() if f.is_file()}
-    new_files = current_files - _known_approved
+    """Execute all files currently in Approved/.
 
-    for filename in sorted(new_files):
+    We process every file present each cycle rather than tracking "new" files.
+    Processed files are moved to Done/ so they naturally disappear from Approved/
+    and won't be double-processed. This is simpler and avoids the race condition
+    where two orchestrator instances update _known_approved simultaneously,
+    causing files to be silently skipped.
+    """
+    current_files = sorted(f.name for f in APPROVED_DIR.iterdir() if f.is_file())
+    for filename in current_files:
         filepath = APPROVED_DIR / filename
+        if not filepath.exists():
+            continue  # already processed (e.g. by a concurrent instance)
         logger.info("Approved action detected: %s", filename)
         _execute_approved_action(filepath)
-
-    # Re-read after execution (files get moved to Done/)
-    _known_approved = {f.name for f in APPROVED_DIR.iterdir() if f.is_file()}
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +1151,25 @@ def _scan_approved():
 
 def main():
     global _running
+
+    # Singleton guard — prevent two orchestrator instances competing for files
+    lock_path = BASE_DIR / "orchestrator.lock"
+    lock_file = None
+    try:
+        if lock_path.exists():
+            old_pid = int(lock_path.read_text().strip())
+            try:
+                os.kill(old_pid, 0)
+                logger.error(
+                    "Another orchestrator instance already running (PID %d). Exiting.", old_pid
+                )
+                sys.exit(1)
+            except (OSError, ProcessLookupError):
+                pass  # stale lock
+        lock_path.write_text(str(os.getpid()))
+        lock_file = lock_path
+    except Exception:
+        logger.warning("Could not acquire orchestrator lockfile — proceeding anyway", exc_info=True)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -695,14 +1180,10 @@ def main():
     logger.info("Poll interval: %ds", POLL_INTERVAL)
     logger.info("=" * 60)
 
-    # Start with empty approved set — process ALL approved files on startup
-    global _known_approved
-    _known_approved = set()
-
     needs_count = len([f for f in NEEDS_ACTION_DIR.iterdir() if f.is_file()])
     approved_count = len([f for f in APPROVED_DIR.iterdir() if f.is_file()])
     logger.info(
-        "Initial state: %d file(s) in Needs_Action, %d in Approved — will process all",
+        "Initial state: %d file(s) in Needs_Action, %d in Approved",
         needs_count,
         approved_count,
     )
@@ -711,6 +1192,7 @@ def main():
         try:
             _scan_needs_action()
             _scan_approved()
+            _schedule_linkedin_post_if_due()
         except Exception:
             logger.exception("Error during orchestration cycle")
 
@@ -718,6 +1200,12 @@ def main():
             if not _running:
                 break
             time.sleep(1)
+
+    if lock_file and lock_file.exists():
+        try:
+            lock_file.unlink()
+        except Exception:
+            pass
 
     logger.info("orchestrator.py exited cleanly.")
 

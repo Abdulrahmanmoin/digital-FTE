@@ -14,8 +14,8 @@ Boundary:
 
 Assumptions:
 - OAuth credentials file exists at ./credentials/gmail_token.json
-  (generated via Google Cloud Console OAuth flow for the Gmail readonly scope)
-- If the token expires, google-auth will auto-refresh using the refresh token
+  (generated via: python credentials/gmail_oauth_setup.py)
+- If the access token expires, google-auth auto-refreshes using the refresh token
 - The vault path is resolved relative to this script's parent directory
 """
 
@@ -120,7 +120,7 @@ class GmailWatcher(BaseWatcher):
         if not CREDENTIALS_PATH.exists():
             logger.error(
                 "Gmail credentials not found at %s. "
-                "Run the OAuth setup flow first to generate gmail_token.json.",
+                "Run: python credentials/gmail_oauth_setup.py",
                 CREDENTIALS_PATH,
             )
             raise FileNotFoundError(f"Missing credentials: {CREDENTIALS_PATH}")

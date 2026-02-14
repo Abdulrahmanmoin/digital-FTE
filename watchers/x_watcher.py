@@ -3,20 +3,25 @@ x_watcher.py - X/Twitter Sense Component (Playwright Browser Automation)
 
 Responsibility:
 - Connects to X/Twitter via headless Chromium browser (Playwright)
-- Polls for new mentions and keyword matches by scraping pages
-- Creates a structured Markdown file in AI_Employee_Vault/Needs_Action/ for each
-  detected tweet containing metadata, content, and engagement context
+- Polls for new tweets from a curated watchlist of followed accounts
+  (credentials/x_watchlist.json) plus direct @mentions
+- Creates a structured Markdown file in AI_Employee_Vault/Needs_Action/ for
+  each detected tweet containing metadata, content, and engagement context
 - Tracks already-processed tweet IDs to avoid duplicates (persisted to disk)
+- Only fetches new tweets while pipeline capacity remains (executed_actions +
+  in_flight < DAILY_ACTION_LIMIT), ensuring the 24h action cap is respected
 - Keeps browser open between poll cycles; saves session state after each poll
 
 Boundary:
 - READ-ONLY scraping — does NOT like, retweet, reply, or post
+- Does NOT perform keyword/search scraping — watchlist profiles only
 - Does NOT reason, plan, approve, or execute actions
 - Does NOT trigger the orchestrator directly; communication is file-based only
 
 Assumptions:
 - Session file at credentials/x_session.json (created via browser/x_setup.py)
-- Keywords config at credentials/x_keywords.json
+- Watchlist config at credentials/x_watchlist.json
+  Format: [{"username": "handle", "notes": "optional context"}, ...]
 - The vault path is resolved relative to this script's parent directory
 """
 
@@ -24,7 +29,7 @@ import json
 import logging
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Add parent dir to path so imports work when run standalone
@@ -38,7 +43,9 @@ from browser.x_browser import (
     save_session,
     check_login_state,
     parse_tweets_from_page,
-    build_search_url,
+    parse_following_from_page,
+    build_following_url,
+    build_profile_url,
     build_mentions_url,
     human_delay,
 )
@@ -51,12 +58,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 VAULT_PATH = BASE_DIR / "AI_Employee_Vault"
 CREDENTIALS_DIR = BASE_DIR / "credentials"
 SESSION_PATH = CREDENTIALS_DIR / "x_session.json"
-KEYWORDS_PATH = CREDENTIALS_DIR / "x_keywords.json"
+WATCHLIST_PATH = CREDENTIALS_DIR / "x_watchlist.json"
 PROCESSED_IDS_PATH = CREDENTIALS_DIR / ".x_processed_ids.json"
+X_DAILY_ACTIONS_PATH = CREDENTIALS_DIR / ".x_daily_actions.json"
 
-CHECK_INTERVAL = 180  # seconds between polls (3 minutes)
+# Pipeline capacity: watcher only fetches tweets while executed_actions + in_flight < this limit
+DAILY_ACTION_LIMIT = 5
+QUOTA_WINDOW_HOURS = 24         # Hours in a quota window
 
-# Our own X/Twitter username (without @)
+CHECK_INTERVAL = 180            # seconds between polls (3 minutes)
+FOLLOWING_SYNC_INTERVAL_HOURS = 24  # How often to re-sync watchlist from Twitter following
+
+# Our own X/Twitter username (without @) — skip our own tweets when scraping
 OWN_USERNAME = "arahmanmoin1"
 
 # Browser crash recovery threshold
@@ -99,8 +112,11 @@ def _sanitize_filename(text: str, max_len: int = 50) -> str:
 class XWatcher(BaseWatcher):
     def __init__(self):
         super().__init__(vault_path=str(VAULT_PATH), check_interval=CHECK_INTERVAL)
-        self.processed_ids: dict[str, str] = {}  # tweet_id -> source (mention/search)
-        self.keywords: list[str] = []
+        self.processed_ids: dict[str, str] = {}  # tweet_id -> source
+        self.watchlist: list[dict] = []           # [{"username": ..., "notes": ...}]
+
+        # Following sync tracking
+        self.last_following_sync: datetime | None = None
 
         # Browser state
         self._pw = None
@@ -111,8 +127,12 @@ class XWatcher(BaseWatcher):
         self._consecutive_failures = 0
 
         self._load_processed_ids()
-        self._load_keywords()
         self._start_browser()
+        # Sync watchlist from live following list (replaces x_watchlist.json)
+        self._sync_watchlist_from_following()
+        # Fall back to saved watchlist if sync failed or browser wasn't ready
+        if not self.watchlist:
+            self._load_watchlist()
 
     # -- Browser lifecycle ----------------------------------------------------
 
@@ -134,7 +154,6 @@ class XWatcher(BaseWatcher):
             )
             self._page = self._context.new_page()
 
-            # Verify login
             if check_login_state(self._page):
                 logger.info("Browser started and login verified.")
                 self._browser_healthy = True
@@ -179,18 +198,153 @@ class XWatcher(BaseWatcher):
 
     # -- Config loading -------------------------------------------------------
 
-    def _load_keywords(self):
-        """Load keyword search terms from config file."""
-        if KEYWORDS_PATH.exists():
+    def _load_watchlist(self):
+        """Load the watchlist of accounts to monitor from config file.
+
+        Format: [{"username": "handle", "notes": "optional"}, ...]
+        Plain list of strings also accepted: ["handle1", "handle2"]
+        """
+        if not WATCHLIST_PATH.exists():
+            logger.warning(
+                "Watchlist file not found at %s. No profiles to watch.",
+                WATCHLIST_PATH,
+            )
+            self.watchlist = []
+            return
+
+        try:
+            raw = json.loads(WATCHLIST_PATH.read_text(encoding="utf-8"))
+            # Normalise: accept both [{"username": ...}] and ["username", ...]
+            normalised = []
+            for entry in raw:
+                if isinstance(entry, str):
+                    normalised.append({"username": entry, "notes": ""})
+                elif isinstance(entry, dict) and "username" in entry:
+                    normalised.append(entry)
+                else:
+                    logger.warning("Skipping invalid watchlist entry: %s", entry)
+            self.watchlist = normalised
+            usernames = [e["username"] for e in self.watchlist]
+            logger.info(
+                "Loaded %d watchlist account(s): %s",
+                len(self.watchlist),
+                ", ".join(f"@{u}" for u in usernames),
+            )
+        except Exception:
+            logger.exception("Failed to load watchlist; using empty list.")
+            self.watchlist = []
+
+    # -- Following → watchlist sync -------------------------------------------
+
+    def _sync_watchlist_from_following(self):
+        """Scrape the /following page and save all followed accounts to x_watchlist.json.
+
+        Preserves any manually-added 'notes' for accounts that already exist
+        in the watchlist. New accounts are added with an empty notes field.
+        Removes accounts that are no longer followed.
+        """
+        if not self._browser_healthy:
+            logger.warning("Browser not healthy — skipping following sync.")
+            return
+
+        logger.info("Syncing watchlist from Twitter following list (@%s)...", OWN_USERNAME)
+        try:
+            url = build_following_url(OWN_USERNAME)
+            self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            human_delay(3.0, 5.0)
+
+            following = parse_following_from_page(self._page)
+
+            if not following:
+                logger.warning("No accounts returned from following page — skipping save.")
+                return
+
+            # Build lookup of existing notes so they're not lost on refresh
+            existing_notes: dict[str, str] = {
+                e["username"].lower(): e.get("notes", "")
+                for e in self.watchlist
+            }
+
+            new_watchlist = [
+                {
+                    "username": entry["username"],
+                    "display_name": entry.get("display_name", ""),
+                    "notes": existing_notes.get(entry["username"].lower(), ""),
+                }
+                for entry in following
+                if entry.get("username")
+            ]
+
+            WATCHLIST_PATH.write_text(
+                json.dumps(new_watchlist, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.watchlist = new_watchlist
+            self.last_following_sync = datetime.now()
+
+            logger.info(
+                "Watchlist synced: %d account(s) saved to %s",
+                len(new_watchlist), WATCHLIST_PATH,
+            )
+
+        except Exception:
+            logger.exception("Error syncing watchlist from following page")
+
+    def _should_sync_following(self) -> bool:
+        """Return True if the following list is due for a re-sync."""
+        if self.last_following_sync is None:
+            return True
+        return datetime.now() - self.last_following_sync >= timedelta(
+            hours=FOLLOWING_SYNC_INTERVAL_HOURS
+        )
+
+    # -- Pipeline capacity check ----------------------------------------------
+
+    def _pipeline_slots_remaining(self) -> int:
+        """Return how many new tweets the watcher should fetch this poll.
+
+        Logic: only fetch while (executed_actions_today + in_flight) < DAILY_ACTION_LIMIT.
+        - executed_actions_today: read from the shared .x_daily_actions.json
+        - in_flight: files currently in Needs_Action + Pending_Approval + Approved
+          that are tweet actions (haven't been executed yet)
+
+        This ensures the watcher stops fetching once the pipeline is full and
+        resumes only when executed actions free up capacity.
+        """
+        # 1. Read executed actions today from shared orchestrator counter
+        executed_today = 0
+        if X_DAILY_ACTIONS_PATH.exists():
             try:
-                self.keywords = json.loads(KEYWORDS_PATH.read_text(encoding="utf-8"))
-                logger.info("Loaded %d keywords from %s", len(self.keywords), KEYWORDS_PATH)
+                data = json.loads(X_DAILY_ACTIONS_PATH.read_text(encoding="utf-8"))
+                window_start_str = data.get("window_start_time", "")
+                executed_today = data.get("actions_today", 0)
+                # If the 24h window has expired, treat count as 0
+                if window_start_str:
+                    window_start = datetime.fromisoformat(window_start_str)
+                    if datetime.now() - window_start >= timedelta(hours=QUOTA_WINDOW_HOURS):
+                        executed_today = 0
             except Exception:
-                logger.exception("Failed to load keywords; using empty list.")
-                self.keywords = []
-        else:
-            logger.warning("Keywords file not found at %s. No keyword search.", KEYWORDS_PATH)
-            self.keywords = []
+                logger.debug("Could not read X actions counter; assuming 0 executed.")
+
+        # 2. Count in-flight files across the pipeline
+        needs_action_dir = Path(self.needs_action)
+        pending_dir = VAULT_PATH / "Pending_Approval"
+        approved_dir = VAULT_PATH / "Approved"
+
+        in_flight = (
+            len(list(needs_action_dir.glob("TWEET_*.md")))
+            + len(list(pending_dir.glob("ACTION_TWEET_*.md")))
+            + len(list(approved_dir.glob("ACTION_TWEET_*.md")))
+        )
+
+        slots = DAILY_ACTION_LIMIT - executed_today - in_flight
+        slots = max(0, slots)
+
+        logger.info(
+            "X pipeline capacity: limit=%d, executed=%d, in_flight=%d → slots_available=%d",
+            DAILY_ACTION_LIMIT, executed_today, in_flight, slots,
+        )
+        return slots
 
     # -- Processed ID persistence ---------------------------------------------
 
@@ -215,33 +369,28 @@ class XWatcher(BaseWatcher):
     # -- Tweet fetching via browser -------------------------------------------
 
     def _fetch_mentions(self) -> list[dict]:
-        """Scrape the mentions/notifications page for new mentions."""
+        """Scrape the @mentions notifications page for new mentions."""
         tweets = []
         try:
-            mentions_url = build_mentions_url(OWN_USERNAME)
-            logger.debug("Navigating to %s", mentions_url)
-            self._page.goto(mentions_url, wait_until="domcontentloaded", timeout=30_000)
+            url = build_mentions_url(OWN_USERNAME)
+            logger.debug("Navigating to mentions: %s", url)
+            self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             human_delay(3.0, 5.0)
 
-            raw_tweets = parse_tweets_from_page(self._page)
-
-            for tweet in raw_tweets:
+            for tweet in parse_tweets_from_page(self._page):
                 tid = tweet.get("id", "")
                 if not tid or tid in self.processed_ids:
                     continue
-
-                # Skip our own tweets
                 if tweet.get("author_username", "").lower() == OWN_USERNAME.lower():
                     continue
-
                 tweets.append({
                     "id": tid,
                     "text": tweet.get("text", ""),
                     "author_username": tweet.get("author_username", "unknown"),
                     "author_name": tweet.get("author_name", "Unknown"),
-                    "author_id": "",  # Not available via scraping
+                    "author_id": "",
                     "created_at": tweet.get("timestamp", ""),
-                    "conversation_id": "",  # Not available via scraping
+                    "conversation_id": "",
                     "type": "mention",
                     "source": "mentions",
                     "referenced_tweets": [],
@@ -255,57 +404,86 @@ class XWatcher(BaseWatcher):
 
         return tweets
 
-    def _fetch_keyword_results(self) -> list[dict]:
-        """Scrape search results pages for each configured keyword."""
-        if not self.keywords:
+    def _fetch_watchlist_tweets(self) -> list[dict]:
+        """Visit each watchlist account's profile page and scrape their latest tweets."""
+        if not self.watchlist:
+            logger.info("Watchlist is empty — skipping profile scraping.")
             return []
 
         tweets = []
-        for keyword in self.keywords:
+        logger.info("Scanning %d watchlist profile(s)...", len(self.watchlist))
+
+        for entry in self.watchlist:
+            username = entry.get("username", "").strip()
+            if not username:
+                continue
+
             try:
-                search_url = build_search_url(keyword)
-                logger.debug("Searching for '%s': %s", keyword, search_url)
-                self._page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+                url = build_profile_url(username)
+                self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 human_delay(3.0, 5.0)
 
-                raw_tweets = parse_tweets_from_page(self._page)
+                raw = parse_tweets_from_page(self._page)
+                new_for_user = 0
+                skipped_processed = 0
+                skipped_author = 0
 
-                for tweet in raw_tweets:
+                for tweet in raw:
                     tid = tweet.get("id", "")
-                    if not tid or tid in self.processed_ids:
+                    if not tid:
                         continue
-
-                    # Skip our own tweets
-                    if tweet.get("author_username", "").lower() == OWN_USERNAME.lower():
+                    if tid in self.processed_ids:
+                        skipped_processed += 1
+                        continue
+                    # Only collect tweets authored by this watchlist person
+                    if tweet.get("author_username", "").lower() != username.lower():
+                        skipped_author += 1
                         continue
 
                     tweets.append({
                         "id": tid,
                         "text": tweet.get("text", ""),
-                        "author_username": tweet.get("author_username", "unknown"),
-                        "author_name": tweet.get("author_name", "Unknown"),
+                        "author_username": tweet.get("author_username", username),
+                        "author_name": tweet.get("author_name", username),
                         "author_id": "",
                         "created_at": tweet.get("timestamp", ""),
                         "conversation_id": "",
-                        "type": "keyword_match",
-                        "source": "search",
-                        "matched_keyword": keyword,
+                        "type": "watchlist",
+                        "source": "profile",
+                        "watchlist_notes": entry.get("notes", ""),
                         "referenced_tweets": [],
                     })
+                    new_for_user += 1
+
+                logger.info(
+                    "@%-20s  page_tweets=%-3d  new=%-3d  already_seen=%-3d  other_author=%-3d",
+                    username, len(raw), new_for_user, skipped_processed, skipped_author,
+                )
 
             except Exception:
-                logger.exception("Error searching for keyword '%s'", keyword)
+                logger.exception("Error scraping profile for @%s", username)
 
-        if tweets:
-            logger.info("Scraped %d new keyword match(es).", len(tweets))
+            human_delay(2.0, 4.0)  # polite gap between profile visits
+
+        logger.info(
+            "Watchlist scan complete: %d new tweet(s) from %d account(s).",
+            len(tweets), len(self.watchlist),
+        )
         return tweets
 
     # -- BaseWatcher interface ------------------------------------------------
 
     def check_for_updates(self) -> list:
-        """Scrape mentions and keyword search pages, deduplicated."""
+        """Scrape mentions + watchlist profiles, deduplicated, pipeline-capacity-capped."""
+        slots = self._pipeline_slots_remaining()
+        if slots <= 0:
+            logger.info(
+                "Skipping fetch — pipeline full or daily limit reached "
+                "(limit=%d, no free slots).", DAILY_ACTION_LIMIT,
+            )
+            return []
+
         if not self._browser_healthy:
-            # Try to recover if session file exists
             if SESSION_PATH.exists():
                 logger.warning("Browser unhealthy — attempting restart.")
                 self._restart_browser()
@@ -313,6 +491,10 @@ class XWatcher(BaseWatcher):
                 logger.warning("Browser unhealthy and no session file. Skipping poll.")
             if not self._browser_healthy:
                 return []
+
+        # Re-sync following list every FOLLOWING_SYNC_INTERVAL_HOURS
+        if self._should_sync_following():
+            self._sync_watchlist_from_following()
 
         try:
             all_tweets = []
@@ -322,25 +504,33 @@ class XWatcher(BaseWatcher):
 
             human_delay(2.0, 4.0)
 
-            keyword_hits = self._fetch_keyword_results()
-            all_tweets.extend(keyword_hits)
+            watchlist_tweets = self._fetch_watchlist_tweets()
+            all_tweets.extend(watchlist_tweets)
 
-            # Deduplicate by tweet ID (mentions take priority over search)
-            seen = set()
-            unique = []
+            # Deduplicate by tweet ID (mentions take priority)
+            seen: set[str] = set()
+            unique: list[dict] = []
             for t in all_tweets:
                 if t["id"] not in seen:
                     seen.add(t["id"])
                     unique.append(t)
 
-            if unique:
-                logger.info("Total new tweets to process: %d", len(unique))
+            # Cap to available pipeline slots
+            if len(unique) > slots:
+                logger.info(
+                    "Found %d tweets but only %d pipeline slot(s) available. Capping.",
+                    len(unique), slots,
+                )
+                unique = unique[:slots]
 
-            # Save session state to keep cookies fresh
+            logger.info(
+                "Poll cycle complete — %d new tweet(s) queued for pipeline.",
+                len(unique),
+            )
+
             if self._context:
                 save_session(self._context, SESSION_PATH)
 
-            # Reset failure counter on success
             self._consecutive_failures = 0
             return unique
 
@@ -365,20 +555,16 @@ class XWatcher(BaseWatcher):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"TWEET_{timestamp}_{tweet_type}_{author}.md"
 
-        # Build referenced tweets section
-        ref_section = ""
+        ref_section = "None"
         if tweet.get("referenced_tweets"):
-            ref_lines = []
-            for ref in tweet["referenced_tweets"]:
-                ref_lines.append(f"- Type: {ref['type']}, Tweet ID: {ref['id']}")
-            ref_section = "\n".join(ref_lines)
-        else:
-            ref_section = "None"
+            ref_section = "\n".join(
+                f"- Type: {r['type']}, Tweet ID: {r['id']}"
+                for r in tweet["referenced_tweets"]
+            )
 
-        # Build keyword match section
-        keyword_section = ""
-        if tweet.get("matched_keyword"):
-            keyword_section = f"\n## Matched Keyword\n{tweet['matched_keyword']}\n"
+        notes_section = ""
+        if tweet.get("watchlist_notes"):
+            notes_section = f"\n## Watchlist Notes\n{tweet['watchlist_notes']}\n"
 
         content = f"""---
 type: tweet
@@ -398,13 +584,13 @@ status: pending
 # Tweet: {tweet_type} from @{tweet.get('author_username', 'unknown')}
 
 ## Metadata
-| Field      | Value |
-|------------|-------|
-| Author     | @{tweet.get('author_username', 'unknown')} ({tweet.get('author_name', 'Unknown')}) |
-| Tweet ID   | {tid} |
-| Type       | {tweet_type} |
-| Source     | {tweet.get('source', 'unknown')} |
-| Created    | {tweet.get('created_at', 'N/A')} |
+| Field           | Value |
+|-----------------|-------|
+| Author          | @{tweet.get('author_username', 'unknown')} ({tweet.get('author_name', 'Unknown')}) |
+| Tweet ID        | {tid} |
+| Type            | {tweet_type} |
+| Source          | {tweet.get('source', 'unknown')} |
+| Created         | {tweet.get('created_at', 'N/A')} |
 | Conversation ID | {tweet.get('conversation_id', 'N/A')} |
 
 ## Tweet Content
@@ -412,7 +598,7 @@ status: pending
 
 ## Referenced Tweets
 {ref_section}
-{keyword_section}
+{notes_section}
 ## Raw Reference
 - Tweet ID: `{tid}`
 - Author ID: `{tweet.get('author_id', '')}`
@@ -422,7 +608,6 @@ status: pending
         filepath = self.needs_action / filename
         filepath.write_text(content, encoding="utf-8")
 
-        # Track as processed and persist
         self.processed_ids[tid] = tweet.get("source", "unknown")
         self._save_processed_ids()
 
@@ -446,8 +631,12 @@ def main():
     logger.info("x_watcher.py starting — X/Twitter Sense Component (Playwright)")
     logger.info("Vault: %s", VAULT_PATH)
     logger.info("Session: %s", SESSION_PATH)
-    logger.info("Keywords: %s", KEYWORDS_PATH)
+    logger.info("Watchlist: %s", WATCHLIST_PATH)
     logger.info("Poll interval: %ds", CHECK_INTERVAL)
+    logger.info(
+        "Daily action limit: %d replies per %d hours (watcher fetches until pipeline full)",
+        DAILY_ACTION_LIMIT, QUOTA_WINDOW_HOURS,
+    )
     logger.info("=" * 60)
 
     watcher = XWatcher()

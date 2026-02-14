@@ -4,6 +4,13 @@ credentials/
 .env.*
 .mcp.json
 
+# Note: credentials/ includes:
+# - gmail_token.json (OAuth tokens)
+# - x_session.json (Browser session)
+# - .gmail_processed_ids.json (Tracking)
+# - .x_processed_ids.json (Tracking)
+# - .x_daily_quota.json (Rate limiting)
+
 # API keys and tokens
 *.pem
 *.key
@@ -55,6 +62,9 @@ desktop.ini
 # Playwright
 .playwright/
 playwright/.auth/
+
+# Orchestrator Claude workspace — session history files, not source code
+orchestrator_workspace/
 
 # Temporary files
 *.tmp

@@ -2,10 +2,19 @@
 main_watcher.py - System Supervisor / Watchdog
 
 Responsibility:
-- Launches and monitors gmail_watcher.py and orchestrator.py as child processes
+- Launches and monitors gmail_watcher.py, x_watcher.py, linkedin_watcher.py, and orchestrator.py as child processes
 - Automatically restarts any process that crashes, exits, or becomes unresponsive
 - Logs all crashes, restarts, and failures for audit/debugging
-- Runs continuously while the PC is on (managed by PM2)
+- Runs continuously while the PC is on
+
+Usage:
+    python main_watcher.py
+
+    Stop with Ctrl+C (SIGINT) or send SIGTERM — all child processes are
+    gracefully terminated before exit.
+
+    (PM2 support is available via ecosystem.config.js but is not required.
+     Run directly with the command above until PM2 is re-enabled.)
 
 Boundary:
 - Does NOT connect to Gmail
@@ -14,8 +23,7 @@ Boundary:
 - Purely a process lifecycle manager
 
 Assumptions:
-- Python 3.10+ available on PATH
-- PM2 manages this script as the top-level process
+- Python 3.10+ available on PATH (or activate the venv first)
 - All child scripts are in known relative paths
 - Heartbeat check uses a simple "is process alive" poll
 """
@@ -49,6 +57,13 @@ MANAGED_PROCESSES = [
         "restart_delay": 10,      # more conservative — browser needs time to restart
         "max_rapid_restarts": 3,  # fewer restarts allowed before back-off
         "rapid_window": 120,      # wider window for browser stability
+    },
+    {
+        "name": "linkedin_watcher",
+        "cmd": [sys.executable, str(BASE_DIR / "watchers" / "linkedin_watcher.py")],
+        "restart_delay": 15,      # conservative — browser needs time to restart
+        "max_rapid_restarts": 3,
+        "rapid_window": 120,
     },
     {
         "name": "orchestrator",
@@ -201,6 +216,29 @@ def _shutdown(signum, frame):
 def main():
     global _running
 
+    # ---- singleton guard: prevent two main_watcher instances -----------------
+    lock_path = BASE_DIR / "main_watcher.lock"
+    lock_file = None
+    try:
+        if lock_path.exists():
+            old_pid = int(lock_path.read_text().strip())
+            # Check if that process is actually still alive
+            try:
+                os.kill(old_pid, 0)  # signal 0 = liveness check
+                logger.error(
+                    "Another main_watcher.py instance is already running "
+                    "(PID %d, lockfile %s). Exiting.",
+                    old_pid, lock_path,
+                )
+                sys.exit(1)
+            except (OSError, ProcessLookupError):
+                pass  # old PID is dead — stale lock, continue
+        lock_path.write_text(str(os.getpid()))
+        lock_file = lock_path
+    except Exception:
+        logger.warning("Could not acquire lockfile — proceeding anyway", exc_info=True)
+    # --------------------------------------------------------------------------
+
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
@@ -228,6 +266,12 @@ def main():
     logger.info("Shutting down all managed processes...")
     for mp in managed:
         mp.stop()
+
+    if lock_file and lock_file.exists():
+        try:
+            lock_file.unlink()
+        except Exception:
+            pass
 
     logger.info("main_watcher.py exited cleanly.")
 

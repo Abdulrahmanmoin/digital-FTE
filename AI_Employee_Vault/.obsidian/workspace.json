@@ -4,21 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "287944477e42f529",
+        "id": "a4484208066c0d7e",
         "type": "tabs",
         "children": [
           {
-            "id": "d614ea59a7257b8d",
+            "id": "6d17925d2435a081",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Pending_Approval/ACTION_TWEET_TWEET_20260208_121114_keyword_match_FahadDauda5.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "ACTION_TWEET_TWEET_20260208_121114_keyword_match_FahadDauda5"
+              "title": "New tab"
             }
           }
         ]
@@ -78,7 +74,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 453.5
+    "width": 419.5
   },
   "right": {
     "id": "5bd3d1a85f7b0329",
@@ -180,43 +176,43 @@
       "bases:Create new base": false
     }
   },
-  "active": "d614ea59a7257b8d",
+  "active": "6610e86813be1ddb",
   "lastOpenFiles": [
-    "Pending_Approval/ACTION_TWEET_TWEET_20260208_224248_keyword_match_annanya01S.md",
-    "Pending_Approval/ACTION_TWEET_TWEET_20260208_224248_keyword_match_annanya01S.md.tmp.6188.1770580808495",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_annanya01S.md",
-    "Done/processed_20260209_005916_TWEET_20260208_224248_keyword_match_alphatweetz8.md",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_alphatweetz8.md",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_alphatweetz8.md.tmp.19396.1770580749133",
-    "Pending_Approval/ACTION_TWEET_TWEET_20260208_224248_keyword_match_almightyeagle.md",
-    "Pending_Approval/ACTION_TWEET_TWEET_20260208_224248_keyword_match_almightyeagle.md.tmp.1676.1770580707996",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_almightyeagle.md",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_almightyeagle.md.tmp.1676.1770580698660",
-    "Pending_Approval/ACTION_TWEET_TWEET_20260208_224248_keyword_match_ai_fieldguide.md",
-    "Pending_Approval/ACTION_TWEET_TWEET_20260208_224248_keyword_match_ai_fieldguide.md.tmp.8992.1770580655589",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_ai_fieldguide.md",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_ai_fieldguide.md.tmp.8992.1770580646248",
-    "Done/processed_20260209_005641_TWEET_20260208_121114_keyword_match_AlexisSno1.md",
-    "Done/completed_20260209_005641_ACTION_TWEET_TWEET_20260208_121114_keyword_match_AlexisSno1.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_PatriotSeekin.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match____popcorn.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_Thezerogambit.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_iamgtma.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_alina_anto.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_montrellcruse.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_Cryptovoxels1.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_das_connor.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_pablothethinker.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_nigski77.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_darkstalwart.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_RealMezmo.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_EraofAIOfficial.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_burconsult.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_Ravikesh0406.md",
-    "Needs_Action/TWEET_20260209_005624_keyword_match_walpepe1.md",
-    "Pending_Approval/ACTION_TWEET_TWEET_20260208_224248_keyword_match_adi_dwica.md.tmp.18488.1770580550684",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_adi_dwica.md.tmp.18488.1770580540884",
-    "Plans/PLAN_TWEET_20260208_224248_keyword_match_Zephyr_hg.md.tmp.16492.1770580505444",
-    "Pending_Approval/ACTION_TWEET_TWEET_20260208_224248_keyword_match_Wenzi_WW.md.tmp.5472.1770580470425"
+    "Needs_Action/EMAIL_20260214_151420_Meezan Mobile Application Login Alert.md",
+    "Done/processed_20260214_144401_TWEET_20260214_120829_watchlist_ycombinator.md",
+    "Done/completed_20260214_144401_ACTION_TWEET_TWEET_20260214_120829_watchlist_ycombinator.md",
+    "Done/processed_20260214_144330_TWEET_20260214_120829_watchlist_omerkhan.md",
+    "Done/completed_20260214_144330_ACTION_TWEET_TWEET_20260214_120829_watchlist_omerkhan.md",
+    "Done/processed_20260214_144302_TWEET_20260214_120829_watchlist_marclou.md",
+    "Done/completed_20260214_144302_ACTION_TWEET_TWEET_20260214_120829_watchlist_marclou.md",
+    "Approved/ACTION_TWEET_TWEET_20260214_120829_watchlist_omerkhan.md",
+    "Approved/ACTION_TWEET_TWEET_20260214_120829_watchlist_marclou.md",
+    "Approved/ACTION_TWEET_TWEET_20260214_120829_watchlist_ycombinator.md",
+    "Plans/PLAN_TWEET_20260214_120829_watchlist_ycombinator.md",
+    "Done/processed_20260214_143959_TWEET_20260214_120829_watchlist_tinkerimov.md",
+    "Done/processed_20260214_143930_TWEET_20260214_120829_watchlist_sabir_huss50540.md",
+    "Plans/PLAN_TWEET_20260214_120829_watchlist_sabir_huss50540.md",
+    "Needs_Action/TWEET_20260214_120829_watchlist_sabir_huss50540.md",
+    "Done/processed_20260214_143841_TWEET_20260214_120829_watchlist_rileybrown.md",
+    "Plans/PLAN_TWEET_20260214_120829_watchlist_rileybrown.md",
+    "Plans/PLAN_TWEET_20260214_120829_watchlist_omerkhan.md",
+    "Needs_Action/TWEET_20260214_120829_watchlist_omerkhan.md",
+    "Done/processed_20260214_143721_TWEET_20260214_120829_watchlist_mikestrives.md",
+    "Plans/PLAN_TWEET_20260214_120829_watchlist_mikestrives.md",
+    "Needs_Action/TWEET_20260214_120829_watchlist_mikestrives.md",
+    "Done/processed_20260214_143622_TWEET_20260214_120829_watchlist_karthikponna19.md",
+    "Done/completed_20260214_143622_ACTION_TWEET_TWEET_20260214_120829_watchlist_karthikponna19.md",
+    "Done/processed_20260214_143544_TWEET_20260214_120829_watchlist_francescoswiss.md",
+    "Done/completed_20260214_143544_ACTION_TWEET_TWEET_20260214_120829_watchlist_francescoswiss.md",
+    "Pending_Approval/ACTION_TWEET_TWEET_20260214_120829_watchlist_francescoswiss.md.tmp.15816.1771061316605",
+    "Plans/PLAN_TWEET_20260214_120829_watchlist_francescoswiss.md.tmp.15816.1771061312374",
+    "Pending_Approval/ACTION_TWEET_TWEET_20260214_120829_watchlist__adeniyi_s.md.tmp.19728.1771061267437",
+    "Pending_Approval/ACTION_TWEET_TWEET_20260214_120829_watchlist_TakoTreba.md.tmp.13816.1771061218871",
+    "Plans/PLAN_TWEET_20260214_120829_watchlist_Mike_Scully_.md.tmp.17528.1771061152892",
+    "Plans/PLAN_TWEET_20260214_120829_watchlist_LukeWarrd.md.tmp.19260.1771061112851",
+    "Pending_Approval/ACTION_TWEET_TWEET_20260214_120829_watchlist_Austin_Federa.md.tmp.9492.1771060902350",
+    "Pending_Approval/ACTION_LINKEDIN_LINKEDIN_POST_20260214_121223_shariq-sheikh-sherry.md.tmp.10540.1771053684367",
+    "Plans/PLAN_LINKEDIN_POST_20260214_121223_shariq-sheikh-sherry.md.tmp.10540.1771053675155",
+    "Plans/PLAN_LINKEDIN_POST_20260214_121223_sahil-imran-6aa916280.md.tmp.380.1771053643528"
   ]
 }

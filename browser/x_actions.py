@@ -20,6 +20,7 @@ from browser.x_browser import (
     create_playwright_instance,
     launch_browser,
     save_session,
+    check_login_state,
     human_delay,
     SELECTORS,
 )
@@ -69,17 +70,40 @@ def execute_tweet_actions(
         browser, context = launch_browser(pw, headless=True, session_path=session_path)
         page = context.new_page()
 
+        # Warm up: navigate to home first so X recognises the session before
+        # we deep-link into a specific tweet. Skipping this causes timeouts or
+        # interstitial pages on cold browser starts.
+        logger.info("Warming up session — navigating to x.com/home first...")
+        if not check_login_state(page):
+            logger.error(
+                "Not logged in after session restore. "
+                "Run browser/x_setup.py to refresh the session."
+            )
+            return {a: False for a in actions}
+        logger.info("Session verified. Proceeding to tweet.")
+        human_delay(2.0, 3.0)
+
         # Navigate to the tweet
         tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
         logger.info("Navigating to %s", tweet_url)
-        page.goto(tweet_url, wait_until="domcontentloaded", timeout=30_000)
+        page.goto(tweet_url, wait_until="domcontentloaded", timeout=60_000)
         human_delay(2.0, 4.0)
+
+        # Dismiss any overlays (cookie consent, etc.) that block the page
+        _dismiss_overlays(page)
+
+        # Scroll to top to ensure the tweet article is in view
+        page.evaluate("window.scrollTo(0, 0)")
+        human_delay(0.5, 1.0)
 
         # Wait for the tweet to load
         try:
-            page.wait_for_selector(SELECTORS["tweet_article"], timeout=15_000)
+            page.wait_for_selector(SELECTORS["tweet_article"], timeout=30_000)
         except Exception:
-            logger.error("Tweet page did not load properly for %s", tweet_url)
+            logger.error(
+                "Tweet page did not load properly for %s (title=%r, url=%r)",
+                tweet_url, page.title(), page.url,
+            )
             return {a: False for a in actions}
 
         # Execute each action
@@ -117,6 +141,49 @@ def execute_tweet_actions(
                 pass
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Overlay / consent dialog handling
+# ---------------------------------------------------------------------------
+
+def _dismiss_overlays(page) -> None:
+    """Dismiss cookie consent overlays and other blocking UI elements."""
+    try:
+        mask = page.query_selector('[data-testid="twc-cc-mask"]')
+        if not mask:
+            return
+
+        logger.info("Cookie consent overlay detected — attempting to dismiss...")
+
+        # Try clicking a visible dismiss/accept button near the overlay
+        for selector in [
+            '[data-testid="BottomBar"] button:last-child',
+            '[data-testid="BottomBar"] button',
+            'button[data-testid="close"]',
+        ]:
+            try:
+                btn = page.query_selector(selector)
+                if btn and btn.is_visible():
+                    btn.click()
+                    human_delay(0.5, 1.0)
+                    logger.info("Dismissed overlay via %s", selector)
+                    return
+            except Exception:
+                continue
+
+        # Fallback: remove the overlay elements via JavaScript so they no
+        # longer intercept pointer events.
+        logger.info("No dismiss button found — removing overlay via JS")
+        page.evaluate("""
+            () => {
+                const sel = ['[data-testid="twc-cc-mask"]', '[data-testid="BottomBar"]'];
+                sel.forEach(s => { const el = document.querySelector(s); if (el) el.remove(); });
+            }
+        """)
+        human_delay(0.3, 0.6)
+    except Exception:
+        logger.warning("Error dismissing overlays", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -215,19 +282,47 @@ def _do_reply(page, tweet_id: str, reply_text: str) -> bool:
             logger.warning("Reply textarea did not appear for tweet %s", tweet_id)
             return False
 
-        # Type the reply with human-like speed
-        textarea.click()
-        human_delay(0.3, 0.8)
-        textarea.fill(reply_text)
+        # Dismiss any overlays before interacting with the textarea
+        _dismiss_overlays(page)
+
+        # Focus and fill the textarea. Use JS dispatch as a fallback if the
+        # normal Playwright fill is blocked by a residual overlay.
+        try:
+            textarea.click()
+            human_delay(0.3, 0.8)
+            textarea.fill(reply_text)
+        except Exception:
+            logger.info("Direct fill blocked — using JS fallback for textarea")
+            page.evaluate(
+                """(args) => {
+                    const el = document.querySelector('[data-testid="tweetTextarea_0"]');
+                    if (el) {
+                        el.focus();
+                        const nativeInputSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLElement.prototype, 'innerText') ||
+                            Object.getOwnPropertyDescriptor(window.Element.prototype, 'innerHTML');
+                        el.dispatchEvent(new Event('focus'));
+                    }
+                }""",
+                None
+            )
+            textarea.fill(reply_text)
         human_delay(0.5, 1.5)
 
-        # Click the submit button
+        # Dismiss overlays again before submitting (they can reappear)
+        _dismiss_overlays(page)
+
+        # Click the submit button — use JS click as fallback if pointer intercepted
         submit_btn = page.query_selector(SELECTORS["tweet_submit"])
         if not submit_btn:
             logger.warning("Tweet submit button not found for tweet %s", tweet_id)
             return False
 
-        submit_btn.click()
+        try:
+            submit_btn.click()
+        except Exception:
+            logger.info("Direct click blocked — using JS click for submit button")
+            page.evaluate("document.querySelector('[data-testid=\"tweetButton\"]')?.click()")
         human_delay(2.0, 4.0)
 
         logger.info("Successfully replied to tweet %s", tweet_id)
