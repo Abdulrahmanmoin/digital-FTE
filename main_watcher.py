@@ -2,7 +2,7 @@
 main_watcher.py - System Supervisor / Watchdog
 
 Responsibility:
-- Launches and monitors gmail_watcher.py, x_watcher.py, linkedin_watcher.py, and orchestrator.py as child processes
+- Launches and monitors gmail_watcher.py, x_watcher.py, linkedin_watcher.py, instagram_watcher.py, facebook_watcher.py, odoo_watcher.py, and orchestrator.py as child processes
 - Automatically restarts any process that crashes, exits, or becomes unresponsive
 - Logs all crashes, restarts, and failures for audit/debugging
 - Runs continuously while the PC is on
@@ -44,27 +44,55 @@ from datetime import datetime
 BASE_DIR = Path(__file__).resolve().parent
 
 MANAGED_PROCESSES = [
+    # Priority 1 — Gmail (fastest, API-based, most important)
     {
         "name": "gmail_watcher",
         "cmd": [sys.executable, str(BASE_DIR / "watchers" / "gmail_watcher.py")],
-        "restart_delay": 5,       # seconds to wait before restarting
-        "max_rapid_restarts": 5,  # max restarts within the window before back-off
-        "rapid_window": 60,       # seconds window for rapid-restart detection
+        "restart_delay": 5,
+        "max_rapid_restarts": 5,
+        "rapid_window": 60,
     },
-    {
-        "name": "x_watcher",
-        "cmd": [sys.executable, str(BASE_DIR / "watchers" / "x_watcher.py")],
-        "restart_delay": 10,      # more conservative — browser needs time to restart
-        "max_rapid_restarts": 3,  # fewer restarts allowed before back-off
-        "rapid_window": 120,      # wider window for browser stability
-    },
+    # Priority 2 — LinkedIn
     {
         "name": "linkedin_watcher",
         "cmd": [sys.executable, str(BASE_DIR / "watchers" / "linkedin_watcher.py")],
-        "restart_delay": 15,      # conservative — browser needs time to restart
+        "restart_delay": 15,
         "max_rapid_restarts": 3,
         "rapid_window": 120,
     },
+    # Priority 3 — X/Twitter
+    {
+        "name": "x_watcher",
+        "cmd": [sys.executable, str(BASE_DIR / "watchers" / "x_watcher.py")],
+        "restart_delay": 10,
+        "max_rapid_restarts": 3,
+        "rapid_window": 120,
+    },
+    # Priority 4 — Instagram
+    {
+        "name": "instagram_watcher",
+        "cmd": [sys.executable, str(BASE_DIR / "watchers" / "instagram_watcher.py")],
+        "restart_delay": 15,
+        "max_rapid_restarts": 3,
+        "rapid_window": 120,
+    },
+    # Priority 5 — Facebook
+    {
+        "name": "facebook_watcher",
+        "cmd": [sys.executable, str(BASE_DIR / "watchers" / "facebook_watcher.py")],
+        "restart_delay": 15,
+        "max_rapid_restarts": 3,
+        "rapid_window": 120,
+    },
+    # Priority 6 — Odoo (lowest priority, polls every 10 min)
+    {
+        "name": "odoo_watcher",
+        "cmd": [sys.executable, str(BASE_DIR / "watchers" / "odoo_watcher.py")],
+        "restart_delay": 30,       # slow restart — lowest priority
+        "max_rapid_restarts": 3,   # conservative
+        "rapid_window": 180,
+    },
+    # Orchestrator — always last so all watchers are up first
     {
         "name": "orchestrator",
         "cmd": [sys.executable, str(BASE_DIR / "orchestrator.py")],

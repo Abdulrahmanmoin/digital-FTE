@@ -46,6 +46,11 @@ from browser.linkedin_actions import (
     execute_linkedin_actions as browser_execute_linkedin_actions,
     execute_linkedin_post as browser_execute_linkedin_post,
 )
+from browser.instagram_actions import execute_instagram_reply as browser_execute_instagram_reply
+from browser.facebook_actions import (
+    execute_facebook_reply as browser_execute_facebook_reply,
+    execute_facebook_post as browser_execute_facebook_post,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -62,7 +67,7 @@ DONE_DIR = VAULT_PATH / "Done"
 
 POLL_INTERVAL = 15  # seconds between folder scans
 MAX_REASONING_PER_CYCLE = 3  # max Claude Code calls before checking Approved/
-BROWSER_ACTION_TIMEOUT = 90  # seconds before killing a hung browser action
+BROWSER_ACTION_TIMEOUT = 150  # seconds before killing a hung browser action
 CLAUDE_CMD = "claude"  # Claude Code CLI command
 
 # LinkedIn rate limits
@@ -72,10 +77,27 @@ LINKEDIN_POST_INTERVAL_HOURS = 1   # generate a new post draft every N hours
 # X/Twitter rate limits
 X_DAILY_ACTION_LIMIT = 5           # max reply/like/retweet actions per 24h window
 
+# Instagram rate limits
+INSTAGRAM_DAILY_ACTION_LIMIT = 5   # max DM replies per 24h window
+
+# Facebook rate limits
+FACEBOOK_DAILY_ACTION_LIMIT = 5    # max DM replies per 24h window
+FACEBOOK_POST_INTERVAL_HOURS = 2   # generate a new post draft every N hours
+
 CREDENTIALS_DIR = BASE_DIR / "credentials"
 LINKEDIN_DAILY_ACTIONS_PATH = CREDENTIALS_DIR / ".linkedin_daily_actions.json"
 LINKEDIN_LAST_POST_PATH = CREDENTIALS_DIR / ".linkedin_last_post.json"
 X_DAILY_ACTIONS_PATH = CREDENTIALS_DIR / ".x_daily_actions.json"
+INSTAGRAM_DAILY_ACTIONS_PATH = CREDENTIALS_DIR / ".instagram_daily_actions.json"
+FACEBOOK_DAILY_ACTIONS_PATH = CREDENTIALS_DIR / ".facebook_daily_actions.json"
+FACEBOOK_LAST_POST_PATH = CREDENTIALS_DIR / ".facebook_last_post.json"
+
+# Session alert config
+# Change SESSION_ALERT_EMAIL to the address you want alerts sent to.
+SESSION_ALERT_EMAIL = "arahmanmoin1@gmail.com"
+SESSION_ALERT_COOLDOWN_HOURS = 24   # min hours between alerts for the same platform
+SESSION_FAILURE_THRESHOLD = 2       # consecutive failures before alerting
+SESSION_ALERTS_STATE_PATH = CREDENTIALS_DIR / ".session_alerts.json"
 
 # Dedicated working directory for all orchestrator-triggered Claude invocations.
 # Claude Code scopes conversation history by cwd, so using a subdirectory here
@@ -230,6 +252,243 @@ def _increment_x_action_count():
 
 
 # ---------------------------------------------------------------------------
+# Instagram daily action quota (DM replies, max 5/24h)
+# ---------------------------------------------------------------------------
+
+def _load_instagram_action_quota() -> tuple[int, datetime]:
+    if INSTAGRAM_DAILY_ACTIONS_PATH.exists():
+        try:
+            data = json.loads(INSTAGRAM_DAILY_ACTIONS_PATH.read_text(encoding="utf-8"))
+            count = data.get("actions_today", 0)
+            window_start = datetime.fromisoformat(
+                data.get("window_start_time", datetime.now().isoformat())
+            )
+            return count, window_start
+        except Exception:
+            logger.exception("Failed to load Instagram action quota; resetting.")
+    return 0, datetime.now()
+
+
+def _save_instagram_action_quota(count: int, window_start: datetime):
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    INSTAGRAM_DAILY_ACTIONS_PATH.write_text(
+        json.dumps({"actions_today": count, "window_start_time": window_start.isoformat()}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _instagram_actions_remaining() -> int:
+    count, window_start = _load_instagram_action_quota()
+    if datetime.now() - window_start >= timedelta(hours=24):
+        logger.info("Instagram action quota window expired — resetting.")
+        _save_instagram_action_quota(0, datetime.now())
+        return INSTAGRAM_DAILY_ACTION_LIMIT
+    return max(0, INSTAGRAM_DAILY_ACTION_LIMIT - count)
+
+
+def _increment_instagram_action_count():
+    count, window_start = _load_instagram_action_quota()
+    if datetime.now() - window_start >= timedelta(hours=24):
+        count = 0
+        window_start = datetime.now()
+    count += 1
+    _save_instagram_action_quota(count, window_start)
+    logger.info("Instagram action quota: %d/%d used.", count, INSTAGRAM_DAILY_ACTION_LIMIT)
+
+
+# ---------------------------------------------------------------------------
+# Facebook daily action quota (DM replies, max 5/24h)
+# ---------------------------------------------------------------------------
+
+def _load_facebook_action_quota() -> tuple[int, datetime]:
+    if FACEBOOK_DAILY_ACTIONS_PATH.exists():
+        try:
+            data = json.loads(FACEBOOK_DAILY_ACTIONS_PATH.read_text(encoding="utf-8"))
+            count = data.get("actions_today", 0)
+            window_start = datetime.fromisoformat(
+                data.get("window_start_time", datetime.now().isoformat())
+            )
+            return count, window_start
+        except Exception:
+            logger.exception("Failed to load Facebook action quota; resetting.")
+    return 0, datetime.now()
+
+
+def _save_facebook_action_quota(count: int, window_start: datetime):
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    FACEBOOK_DAILY_ACTIONS_PATH.write_text(
+        json.dumps({"actions_today": count, "window_start_time": window_start.isoformat()}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _facebook_actions_remaining() -> int:
+    count, window_start = _load_facebook_action_quota()
+    if datetime.now() - window_start >= timedelta(hours=24):
+        logger.info("Facebook action quota window expired — resetting.")
+        _save_facebook_action_quota(0, datetime.now())
+        return FACEBOOK_DAILY_ACTION_LIMIT
+    return max(0, FACEBOOK_DAILY_ACTION_LIMIT - count)
+
+
+def _increment_facebook_action_count():
+    count, window_start = _load_facebook_action_quota()
+    if datetime.now() - window_start >= timedelta(hours=24):
+        count = 0
+        window_start = datetime.now()
+    count += 1
+    _save_facebook_action_quota(count, window_start)
+    logger.info("Facebook action quota: %d/%d used.", count, FACEBOOK_DAILY_ACTION_LIMIT)
+
+
+# ---------------------------------------------------------------------------
+# Session expiry alerting
+# ---------------------------------------------------------------------------
+
+# In-memory consecutive failure counters, keyed by platform name.
+# Reset to 0 on any successful action for that platform.
+_session_failure_counts: dict[str, int] = {
+    "linkedin": 0,
+    "x": 0,
+    "instagram": 0,
+    "facebook": 0,
+}
+
+SETUP_COMMANDS = {
+    "linkedin":  "python browser/linkedin_setup.py",
+    "x":         "python browser/x_setup.py",
+    "instagram": "python browser/instagram_setup.py",
+    "facebook":  "python browser/facebook_setup.py",
+}
+
+
+def _load_session_alerts_state() -> dict:
+    """Load the last-alerted timestamps per platform from disk."""
+    if SESSION_ALERTS_STATE_PATH.exists():
+        try:
+            return json.loads(SESSION_ALERTS_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_session_alerts_state(state: dict):
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_ALERTS_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _session_alert_due(platform: str) -> bool:
+    """Return True if enough time has passed since the last alert for this platform."""
+    state = _load_session_alerts_state()
+    last_str = state.get(platform)
+    if not last_str:
+        return True
+    try:
+        last = datetime.fromisoformat(last_str)
+        return datetime.now() - last >= timedelta(hours=SESSION_ALERT_COOLDOWN_HOURS)
+    except Exception:
+        return True
+
+
+def _record_session_alert_sent(platform: str):
+    state = _load_session_alerts_state()
+    state[platform] = datetime.now().isoformat()
+    _save_session_alerts_state(state)
+
+
+def _send_session_alert_email(platform: str):
+    """Send a Gmail alert email when a platform session appears to have expired.
+
+    Uses the same Claude+MCP subprocess approach as normal email sending.
+    Rate-limited by SESSION_ALERT_COOLDOWN_HOURS to avoid inbox flooding.
+    """
+    if not _session_alert_due(platform):
+        logger.debug("Session alert for %s skipped — within cooldown window.", platform)
+        return
+
+    setup_cmd = SETUP_COMMANDS.get(platform, f"python browser/{platform}_setup.py")
+    subject = f"[AI Employee] {platform.capitalize()} session expired — action required"
+    body = (
+        f"Your AI Employee system has detected that the {platform.capitalize()} "
+        f"browser session has expired.\n\n"
+        f"The {platform.capitalize()} watcher has failed to act {SESSION_FAILURE_THRESHOLD} "
+        f"times in a row. No new {platform.capitalize()} actions will be executed until "
+        f"the session is refreshed.\n\n"
+        f"To fix this, run the following command on your server:\n\n"
+        f"    {setup_cmd}\n\n"
+        f"Then restart the AI Employee system:\n\n"
+        f"    pm2 restart ai-employee\n\n"
+        f"This alert will not repeat for {SESSION_ALERT_COOLDOWN_HOURS} hours.\n\n"
+        f"— AI Employee Orchestrator\n"
+        f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    send_prompt = (
+        f"Send a notification email using the mcp__gmail__send_email tool.\n\n"
+        f"To: {SESSION_ALERT_EMAIL}\n"
+        f"Subject: {subject}\n"
+        f"Body (send exactly as written):\n\n{body}\n\n"
+        f"RULES:\n"
+        f"- Use mcp__gmail__send_email. Do NOT create any files or read anything.\n"
+        f"- Send the body exactly as shown above.\n"
+    )
+
+    logger.info(
+        "Sending session expiry alert for platform '%s' to %s",
+        platform, SESSION_ALERT_EMAIL,
+    )
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [CLAUDE_CMD, "-p", "--allowedTools", "mcp__gmail__send_email"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(ORCHESTRATOR_WORKSPACE_DIR),
+        )
+        stdout, stderr = proc.communicate(input=send_prompt, timeout=60)
+        if proc.returncode == 0:
+            logger.info("Session alert email sent for '%s'.", platform)
+            _record_session_alert_sent(platform)
+        else:
+            logger.error(
+                "Failed to send session alert for '%s' (exit=%d): %s",
+                platform, proc.returncode, stderr[:300],
+            )
+    except subprocess.TimeoutExpired:
+        logger.error("Session alert email timed out for '%s' — killing.", platform)
+        if proc:
+            _kill_process_tree(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        logger.exception("Unexpected error sending session alert for '%s'", platform)
+
+
+def _record_platform_failure(platform: str):
+    """Increment the consecutive failure counter and fire an alert if threshold hit."""
+    _session_failure_counts[platform] = _session_failure_counts.get(platform, 0) + 1
+    count = _session_failure_counts[platform]
+    logger.warning(
+        "Platform '%s' consecutive failure count: %d/%d",
+        platform, count, SESSION_FAILURE_THRESHOLD,
+    )
+    if count >= SESSION_FAILURE_THRESHOLD:
+        _send_session_alert_email(platform)
+
+
+def _record_platform_success(platform: str):
+    """Reset the consecutive failure counter after a successful action."""
+    if _session_failure_counts.get(platform, 0) > 0:
+        logger.info("Platform '%s' action succeeded — resetting failure counter.", platform)
+    _session_failure_counts[platform] = 0
+
+
+# ---------------------------------------------------------------------------
 # LinkedIn post scheduling (one drafted post per hour)
 # ---------------------------------------------------------------------------
 
@@ -265,6 +524,44 @@ def _schedule_linkedin_post_if_due():
     )
     _trigger_claude_linkedin_post_draft()
     _save_last_linkedin_post_time()
+
+
+# ---------------------------------------------------------------------------
+# Facebook post scheduling (one drafted post per FACEBOOK_POST_INTERVAL_HOURS)
+# ---------------------------------------------------------------------------
+
+def _load_last_facebook_post_time() -> datetime:
+    """Return the datetime of the last Facebook post draft, or epoch if never."""
+    if FACEBOOK_LAST_POST_PATH.exists():
+        try:
+            data = json.loads(FACEBOOK_LAST_POST_PATH.read_text(encoding="utf-8"))
+            return datetime.fromisoformat(data.get("last_scheduled_at", "1970-01-01T00:00:00"))
+        except Exception:
+            pass
+    return datetime(1970, 1, 1)
+
+
+def _save_last_facebook_post_time():
+    """Persist the current time as the last Facebook post schedule time."""
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    FACEBOOK_LAST_POST_PATH.write_text(
+        json.dumps({"last_scheduled_at": datetime.now().isoformat()}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _schedule_facebook_post_if_due():
+    """Draft a new Facebook post for human review if the interval has elapsed."""
+    last = _load_last_facebook_post_time()
+    if datetime.now() - last < timedelta(hours=FACEBOOK_POST_INTERVAL_HOURS):
+        return  # not yet time
+
+    logger.info(
+        "Facebook post interval elapsed (%.1fh since last draft) — scheduling new post draft.",
+        (datetime.now() - last).total_seconds() / 3600,
+    )
+    _trigger_claude_facebook_post_draft()
+    _save_last_facebook_post_time()
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +811,254 @@ IMPORTANT RULES:
 """
 
     _invoke_claude_reasoning(task_file, prompt)
+
+
+def _trigger_claude_odoo_reasoning(task_file: Path):
+    """
+    Invoke Claude Code CLI to reason about an Odoo event task file.
+
+    Claude is responsible for:
+    - Reading the Odoo event file (sale order or invoice change)
+    - Assessing urgency and recommending a course of action
+    - Creating a plan file in /Plans
+    - Creating an approval file in /Pending_Approval with suggested next steps
+    """
+    prompt = f"""You are an AI Business Operations Assistant monitoring Odoo (ERP system) for the user.
+
+STEP 1: Read the Odoo event task file at this exact path:
+  {task_file}
+
+STEP 2: Analyze the event and determine what action or follow-up is recommended.
+Consider:
+- What changed? (new record, state change, payment status change, overdue?)
+- How urgent is this? (overdue invoice > new order > routine state change)
+- Is any immediate follow-up required? (send reminder, confirm order, escalate?)
+- What is the business impact? (large amount, key customer, blocked workflow?)
+
+STEP 3: Create a plan file at this exact path:
+  {PLANS_DIR / ('PLAN_' + task_file.name)}
+
+The plan file should contain:
+- What happened and why it matters
+- Urgency assessment (high / medium / low)
+- Recommended action and reasoning
+
+STEP 4: Create an approval file at this exact path:
+  {PENDING_APPROVAL_DIR / ('ACTION_ODOO_' + task_file.name)}
+
+The approval file MUST use this EXACT format:
+
+---
+type: odoo_action
+odoo_model: "<odoo_model from the task file>"
+record_id: "<record_id from the task file>"
+record_name: "<record_name from the task file>"
+event_type: "<event_type from the task file>"
+urgency: "<high|medium|low>"
+source_task: "{task_file.name}"
+status: pending_approval
+---
+
+# Odoo Event: <event_type> — <record_name>
+
+## Summary
+<1-2 sentence summary of what happened>
+
+## Urgency: <HIGH / MEDIUM / LOW>
+<Brief reason for the urgency level>
+
+## Recommended Actions
+<List of specific actions for the human to take in Odoo or externally.
+Be concrete and actionable. Example:
+- Send payment reminder email to [Customer Name]
+- Register payment in Odoo: Accounting > Customers > Invoices > [INV-XXXX] > Register Payment
+- Confirm the sales order and schedule delivery
+- Escalate to manager: amount exceeds threshold>
+
+## Context
+<Any additional context, risks, or notes the human should know>
+
+IMPORTANT RULES:
+- You MUST create both files (plan + approval) by writing them to disk.
+- Be specific and actionable. Name the exact record, customer, and amounts.
+- Do NOT modify Odoo or send any emails yourself. Only create the files.
+- Do NOT modify or delete any existing files.
+- If the event is routine and requires no action (e.g. minor internal state change),
+  create the plan file explaining why, but skip creating the approval file.
+"""
+
+    _invoke_claude_reasoning(task_file, prompt)
+
+
+def _trigger_claude_instagram_reasoning(task_file: Path):
+    """
+    Invoke Claude Code CLI to reason about an Instagram DM and draft a reply.
+    """
+    prompt = f"""You are an AI Instagram DM Assistant managing direct messages for the user.
+
+STEP 1: Read the Instagram DM task file at this exact path:
+  {task_file}
+
+STEP 2: Analyze the message and decide whether a reply is appropriate.
+Consider:
+- Is this a genuine message from a real person (not spam/bot)?
+- What is the sender asking or saying?
+- What tone is appropriate? (friendly, professional, helpful)
+- Does this require a response at all?
+
+STEP 3: Create a plan file at this exact path:
+  {PLANS_DIR / ('PLAN_' + task_file.name)}
+
+The plan file should contain:
+- Summary of the message
+- Your reasoning for the reply approach
+- Why you chose to reply or ignore
+
+STEP 4: If a reply is appropriate, create an approval file at this exact path:
+  {PENDING_APPROVAL_DIR / ('ACTION_INSTAGRAM_' + task_file.name)}
+
+The approval file MUST use this EXACT format:
+
+---
+type: instagram_action
+action: reply
+thread_id: "<thread_id from the task file>"
+sender: "<sender from the task file>"
+source_task: "{task_file.name}"
+status: pending_approval
+---
+
+# Instagram DM Reply — <sender>
+
+## Original Message
+<paste the full message content here>
+
+## Proposed Reply
+
+## Action 1: Reply
+<Write the full reply text here. Keep it natural, conversational, and genuine.
+Match the tone of the original message. Be concise — Instagram DMs are casual.
+Do NOT use corporate language or generic filler phrases.>
+
+IMPORTANT RULES:
+- You MUST create both files (plan + approval) by writing them to disk.
+- Write naturally as if you are the account owner.
+- Do NOT send any message yourself. Only create the files.
+- Do NOT modify or delete any existing files.
+- If the message is spam, a bot, or clearly doesn't need a reply, create only
+  the plan file explaining why — skip creating the approval file.
+"""
+    _invoke_claude_reasoning(task_file, prompt)
+
+
+def _trigger_claude_facebook_reasoning(task_file: Path):
+    """
+    Invoke Claude Code CLI to reason about a Facebook DM and draft a reply.
+    """
+    prompt = f"""You are an AI Facebook Messenger Assistant managing direct messages for the user.
+
+STEP 1: Read the Facebook DM task file at this exact path:
+  {task_file}
+
+STEP 2: Analyze the message and decide whether a reply is appropriate.
+Consider:
+- Is this a genuine message from a real person (not spam/bot)?
+- What is the sender asking or saying?
+- What tone is appropriate? (friendly, professional, helpful)
+- Does this require a response at all?
+
+STEP 3: Create a plan file at this exact path:
+  {PLANS_DIR / ('PLAN_' + task_file.name)}
+
+The plan file should contain:
+- Summary of the message
+- Your reasoning for the reply approach
+- Why you chose to reply or ignore
+
+STEP 4: If a reply is appropriate, create an approval file at this exact path:
+  {PENDING_APPROVAL_DIR / ('ACTION_FACEBOOK_' + task_file.name)}
+
+The approval file MUST use this EXACT format:
+
+---
+type: facebook_action
+action: reply
+thread_id: "<thread_id from the task file>"
+sender: "<sender from the task file>"
+source_task: "{task_file.name}"
+status: pending_approval
+---
+
+# Facebook DM Reply — <sender>
+
+## Original Message
+<paste the full message content here>
+
+## Proposed Reply
+
+## Action 1: Reply
+<Write the full reply text here. Keep it natural, conversational, and genuine.
+Match the tone of the original message. Be concise — Messenger DMs are casual.
+Do NOT use corporate language or generic filler phrases.>
+
+IMPORTANT RULES:
+- You MUST create both files (plan + approval) by writing them to disk.
+- Write naturally as if you are the account owner.
+- Do NOT send any message yourself. Only create the files.
+- Do NOT modify or delete any existing files.
+- If the message is spam, a bot, or clearly doesn't need a reply, create only
+  the plan file explaining why — skip creating the approval file.
+"""
+    _invoke_claude_reasoning(task_file, prompt)
+
+
+def _trigger_claude_facebook_post_draft():
+    """Invoke Claude Code CLI to draft an original Facebook post for human review.
+
+    Writes directly to Pending_Approval/ (no Needs_Action task file needed —
+    the trigger is time-based, not inbox-based).
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    approval_filename = f"ACTION_FACEBOOK_POST_{timestamp}.md"
+    approval_path = PENDING_APPROVAL_DIR / approval_filename
+
+    prompt = f"""You are an AI Facebook Content Creator for the user, a software engineer
+focused on coding, AI, web development, and agentic systems.
+
+Your task is to draft ONE original Facebook post for human review and approval.
+This post will be reviewed before being published — do NOT publish anything yourself.
+
+Create an approval file at this exact path:
+  {approval_path}
+
+The approval file MUST use this EXACT format (including the YAML frontmatter):
+
+---
+type: facebook_post_action
+source_task: "scheduled_post"
+status: pending_approval
+---
+
+# Proposed Facebook Post
+
+<Write an engaging Facebook post here. The post should:
+- Be conversational and relatable — Facebook is more personal than LinkedIn
+- Be about a relevant topic: AI, coding, developer life, tech tips, personal stories
+- Be 100-250 words
+- Share genuine insight, a practical tip, or a short story
+- End with a question to encourage comments
+- Use short paragraphs — no markdown headers or bullet points
+- Feel authentic and personal>
+
+IMPORTANT RULES:
+- Create ONLY this one file — nothing else.
+- Do NOT read any other files.
+- Do NOT post or send anything.
+- Write the post content directly after the "# Proposed Facebook Post" heading.
+"""
+
+    logger.info("Drafting scheduled Facebook post → %s", approval_filename)
+    _invoke_claude_reasoning(approval_path, prompt)
 
 
 def _trigger_claude_linkedin_post_draft():
@@ -811,7 +1356,9 @@ def _execute_tweet_actions(approved_file: Path, meta: dict) -> bool:
         encoding="utf-8",
     )
 
-    # Evaluate overall success: like/retweet failures are warnings, reply failure is critical
+    # Evaluate overall success: like/retweet failures are warnings, reply failure is critical.
+    # However, if ALL actions failed (even non-critical ones), treat as platform failure —
+    # this catches session-expiry scenarios where only like/retweet was requested.
     overall_success = True
     for action_name, success in results.items():
         if not success:
@@ -820,6 +1367,12 @@ def _execute_tweet_actions(approved_file: Path, meta: dict) -> bool:
             else:
                 logger.error("Action '%s' failed for tweet %s", action_name, tweet_id)
                 overall_success = False
+
+    if results and not any(results.values()):
+        logger.error(
+            "All actions failed for tweet %s — likely a session or network issue.", tweet_id
+        )
+        overall_success = False
 
     return overall_success
 
@@ -901,7 +1454,8 @@ def _execute_linkedin_actions(approved_file: Path, meta: dict) -> bool:
         encoding="utf-8",
     )
 
-    # like failure = warning; comment failure = critical
+    # like failure = warning; comment failure = critical.
+    # If ALL actions failed, treat as platform failure regardless (session expiry detection).
     overall_success = True
     for action_name, success in results.items():
         if not success:
@@ -910,6 +1464,12 @@ def _execute_linkedin_actions(approved_file: Path, meta: dict) -> bool:
             else:
                 logger.error("Action '%s' failed for LinkedIn post %s", action_name, post_urn)
                 overall_success = False
+
+    if results and not any(results.values()):
+        logger.error(
+            "All actions failed for LinkedIn post %s — likely a session or network issue.", post_urn
+        )
+        overall_success = False
 
     return overall_success
 
@@ -961,6 +1521,165 @@ def _execute_linkedin_post_action(approved_file: Path, meta: dict) -> bool:
     return success
 
 
+def _execute_instagram_reply_action(approved_file: Path, meta: dict) -> bool:
+    """Send an approved Instagram DM reply via Playwright."""
+    thread_id = meta.get("thread_id", "")
+    sender = meta.get("sender", "unknown")
+
+    if not thread_id:
+        logger.error("Approved Instagram action missing 'thread_id': %s", approved_file)
+        return False
+
+    # Extract reply text from the approval file
+    text = approved_file.read_text(encoding="utf-8")
+    reply_match = re.search(
+        r"##\s*Action\s*\d+:\s*[Rr]eply\s*\n(.*?)(?:\n##|\n---|\Z)",
+        text,
+        re.DOTALL,
+    )
+    if not reply_match:
+        logger.error("No reply text found in %s", approved_file)
+        return False
+
+    reply_text = reply_match.group(1).strip()
+    reply_text = re.sub(r"^#+\s+.*$", "", reply_text, flags=re.MULTILINE).strip()
+
+    if not reply_text:
+        logger.error("Empty reply text in %s", approved_file)
+        return False
+
+    logger.info(
+        "Executing Instagram reply to @%s thread=%s (%d chars)",
+        sender, thread_id, len(reply_text),
+    )
+
+    try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            browser_execute_instagram_reply,
+            thread_id=thread_id,
+            reply_text=reply_text,
+            sender_username=sender,
+        )
+        try:
+            success = future.result(timeout=BROWSER_ACTION_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "Instagram reply timed out after %ds for thread %s",
+                BROWSER_ACTION_TIMEOUT, thread_id,
+            )
+            success = False
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        logger.exception("Error executing Instagram reply from %s", approved_file.name)
+        success = False
+
+    return success
+
+
+def _execute_facebook_reply_action(approved_file: Path, meta: dict) -> bool:
+    """Send an approved Facebook Messenger reply via Playwright."""
+    thread_id = meta.get("thread_id", "")
+    sender = meta.get("sender", "unknown")
+
+    if not thread_id:
+        logger.error("Approved Facebook action missing 'thread_id': %s", approved_file)
+        return False
+
+    text = approved_file.read_text(encoding="utf-8")
+    reply_match = re.search(
+        r"##\s*Action\s*\d+:\s*[Rr]eply\s*\n(.*?)(?:\n##|\n---|\Z)",
+        text,
+        re.DOTALL,
+    )
+    if not reply_match:
+        logger.error("No reply text found in %s", approved_file)
+        return False
+
+    reply_text = reply_match.group(1).strip()
+    reply_text = re.sub(r"^#+\s+.*$", "", reply_text, flags=re.MULTILINE).strip()
+
+    if not reply_text:
+        logger.error("Empty reply text in %s", approved_file)
+        return False
+
+    logger.info(
+        "Executing Facebook reply to %s thread=%s (%d chars)",
+        sender, thread_id, len(reply_text),
+    )
+
+    try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            browser_execute_facebook_reply,
+            thread_id=thread_id,
+            reply_text=reply_text,
+            sender_name=sender,
+        )
+        try:
+            success = future.result(timeout=BROWSER_ACTION_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "Facebook reply timed out after %ds for thread %s",
+                BROWSER_ACTION_TIMEOUT, thread_id,
+            )
+            success = False
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        logger.exception("Error executing Facebook reply from %s", approved_file.name)
+        success = False
+
+    return success
+
+
+def _execute_facebook_post_action(approved_file: Path, meta: dict) -> bool:
+    """Post an original Facebook wall post from a human-approved draft."""
+    text = approved_file.read_text(encoding="utf-8")
+    post_match = re.search(
+        r"#\s*Proposed Facebook Post\s*\n(.*?)(?:\n#|\Z)",
+        text,
+        re.DOTALL,
+    )
+    if not post_match:
+        logger.error("No '# Proposed Facebook Post' section found in %s", approved_file)
+        return False
+
+    content = post_match.group(1).strip()
+    content = re.sub(r"^#+\s+.*$", "", content, flags=re.MULTILINE).strip()
+
+    if not content:
+        logger.error("Empty post content in %s", approved_file)
+        return False
+
+    logger.info("Executing Facebook post from %s (%d chars)", approved_file.name, len(content))
+
+    try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(browser_execute_facebook_post, content)
+        try:
+            success = future.result(timeout=BROWSER_ACTION_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "Facebook post timed out after %ds for %s", BROWSER_ACTION_TIMEOUT, approved_file.name
+            )
+            success = False
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        logger.exception("Error posting Facebook content from %s", approved_file.name)
+        success = False
+
+    audit_path = LOG_DIR / f"facebook_post_{approved_file.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    audit_path.write_text(
+        f"FILE: {approved_file.name}\nCONTENT_LEN: {len(content)}\nSUCCESS: {success}\n\n{content}\n",
+        encoding="utf-8",
+    )
+
+    return success
+
+
 def _execute_approved_action(approved_file: Path):
     """Parse and execute an approved action file, then move it to Done/."""
     meta = _parse_frontmatter(approved_file)
@@ -989,6 +1708,9 @@ def _execute_approved_action(approved_file: Path):
         success = _execute_tweet_actions(approved_file, meta)
         if success:
             _increment_x_action_count()
+            _record_platform_success("x")
+        else:
+            _record_platform_failure("x")
     elif action_type == "linkedin_action":
         remaining = _linkedin_actions_remaining()
         if remaining <= 0:
@@ -1000,8 +1722,58 @@ def _execute_approved_action(approved_file: Path):
         success = _execute_linkedin_actions(approved_file, meta)
         if success:
             _increment_linkedin_action_count()
+            _record_platform_success("linkedin")
+        else:
+            _record_platform_failure("linkedin")
     elif action_type == "linkedin_post_action":
         success = _execute_linkedin_post_action(approved_file, meta)
+        if success:
+            _record_platform_success("linkedin")
+        else:
+            _record_platform_failure("linkedin")
+    elif action_type == "instagram_action":
+        remaining = _instagram_actions_remaining()
+        if remaining <= 0:
+            logger.info(
+                "Instagram daily reply limit reached (%d/%d) — leaving %s in Approved/ until tomorrow.",
+                INSTAGRAM_DAILY_ACTION_LIMIT, INSTAGRAM_DAILY_ACTION_LIMIT, approved_file.name,
+            )
+            return
+        success = _execute_instagram_reply_action(approved_file, meta)
+        if success:
+            _increment_instagram_action_count()
+            _record_platform_success("instagram")
+        else:
+            _record_platform_failure("instagram")
+    elif action_type == "facebook_action":
+        remaining = _facebook_actions_remaining()
+        if remaining <= 0:
+            logger.info(
+                "Facebook daily reply limit reached (%d/%d) — leaving %s in Approved/ until tomorrow.",
+                FACEBOOK_DAILY_ACTION_LIMIT, FACEBOOK_DAILY_ACTION_LIMIT, approved_file.name,
+            )
+            return
+        success = _execute_facebook_reply_action(approved_file, meta)
+        if success:
+            _increment_facebook_action_count()
+            _record_platform_success("facebook")
+        else:
+            _record_platform_failure("facebook")
+    elif action_type == "facebook_post_action":
+        success = _execute_facebook_post_action(approved_file, meta)
+        if success:
+            _record_platform_success("facebook")
+        else:
+            _record_platform_failure("facebook")
+    elif action_type == "odoo_action":
+        # Observe-only: no automatic execution back into Odoo.
+        # The approval file contains Claude's suggested actions for the human to
+        # carry out manually in Odoo. Mark as completed and archive.
+        logger.info(
+            "Odoo action acknowledged (observe-only mode) — archiving %s",
+            approved_file.name,
+        )
+        success = True
     else:
         logger.warning(
             "Unknown action type '%s/%s' in %s. Moving to Done/ as unhandled.",
@@ -1034,6 +1806,46 @@ def _execute_approved_action(approved_file: Path):
 
 
 # ---------------------------------------------------------------------------
+# Task priority ordering: gmail → linkedin → x → instagram → odoo
+# ---------------------------------------------------------------------------
+
+def _task_priority(filename: str) -> int:
+    """Return a sort key so tasks are processed in the configured priority order."""
+    if filename.startswith(("EMAIL_", "REPLY_")):
+        return 1
+    elif filename.startswith("LINKEDIN_POST_"):
+        return 2
+    elif filename.startswith("TWEET_"):
+        return 3
+    elif filename.startswith("INSTAGRAM_DM_"):
+        return 4
+    elif filename.startswith("FACEBOOK_DM_"):
+        return 5
+    elif filename.startswith("ODOO_"):
+        return 6
+    else:
+        return 7  # unknown types processed last
+
+
+def _approved_priority(filename: str) -> int:
+    """Return a sort key for Approved/ files matching the same priority order."""
+    if filename.startswith("REPLY_"):
+        return 1
+    elif filename.startswith("ACTION_LINKEDIN_"):
+        return 2
+    elif filename.startswith("ACTION_TWEET_"):
+        return 3
+    elif filename.startswith("ACTION_INSTAGRAM_"):
+        return 4
+    elif filename.startswith("ACTION_FACEBOOK_"):
+        return 5
+    elif filename.startswith("ACTION_ODOO_"):
+        return 6
+    else:
+        return 7
+
+
+# ---------------------------------------------------------------------------
 # Folder monitors
 # ---------------------------------------------------------------------------
 
@@ -1047,7 +1859,10 @@ def _scan_needs_action():
 
     - Promo/newsletter emails (no reply needed) → moved to Done/ immediately.
     - Reply-worthy emails → stay in Needs_Action/ and Plans/ until approval cycle completes."""
-    current_files = sorted(f.name for f in NEEDS_ACTION_DIR.iterdir() if f.is_file())
+    current_files = sorted(
+        (f.name for f in NEEDS_ACTION_DIR.iterdir() if f.is_file()),
+        key=_task_priority,
+    )
 
     if not current_files:
         return
@@ -1079,6 +1894,12 @@ def _scan_needs_action():
             approval_prefix = "ACTION_TWEET_"
         elif task_type == "linkedin_post":
             approval_prefix = "ACTION_LINKEDIN_"
+        elif task_type == "odoo_event":
+            approval_prefix = "ACTION_ODOO_"
+        elif task_type == "instagram_dm":
+            approval_prefix = "ACTION_INSTAGRAM_"
+        elif task_type == "facebook_dm":
+            approval_prefix = "ACTION_FACEBOOK_"
         else:
             approval_prefix = "REPLY_"
 
@@ -1088,10 +1909,24 @@ def _scan_needs_action():
         if (PENDING_APPROVAL_DIR / approval_name).exists() or (APPROVED_DIR / approval_name).exists():
             continue
 
-        # Also check if already moved to Done/ (plan exists = already processed)
+        # Check for an orphaned plan: plan exists but no approval is in-flight.
+        # This happens when:
+        #   - Claude created a plan but decided no action was needed (and the task
+        #     wasn't moved to Done/ due to a crash/restart mid-cycle), OR
+        #   - The approval was rejected/deleted by the human without cleaning up
+        #     the plan and task files.
+        # Fix: delete the orphaned plan so the task gets re-reasoned this cycle.
         plan_name = f"PLAN_{filename}"
         if (PLANS_DIR / plan_name).exists():
-            continue
+            logger.info(
+                "Orphaned plan detected for %s (plan exists but no approval in-flight) "
+                "— deleting plan and re-processing.",
+                filename,
+            )
+            try:
+                (PLANS_DIR / plan_name).unlink()
+            except Exception:
+                logger.warning("Could not delete orphaned plan %s", plan_name, exc_info=True)
 
         logger.info("[%d/%d] Processing %s task: %s", idx, total, task_type, filename)
 
@@ -1100,6 +1935,12 @@ def _scan_needs_action():
                 _trigger_claude_tweet_reasoning(filepath)
             elif task_type == "linkedin_post":
                 _trigger_claude_linkedin_reasoning(filepath)
+            elif task_type == "odoo_event":
+                _trigger_claude_odoo_reasoning(filepath)
+            elif task_type == "instagram_dm":
+                _trigger_claude_instagram_reasoning(filepath)
+            elif task_type == "facebook_dm":
+                _trigger_claude_facebook_reasoning(filepath)
             else:
                 _trigger_claude_reasoning(filepath)
         except Exception:
@@ -1136,7 +1977,10 @@ def _scan_approved():
     where two orchestrator instances update _known_approved simultaneously,
     causing files to be silently skipped.
     """
-    current_files = sorted(f.name for f in APPROVED_DIR.iterdir() if f.is_file())
+    current_files = sorted(
+        (f.name for f in APPROVED_DIR.iterdir() if f.is_file()),
+        key=_approved_priority,
+    )
     for filename in current_files:
         filepath = APPROVED_DIR / filename
         if not filepath.exists():
@@ -1193,6 +2037,7 @@ def main():
             _scan_needs_action()
             _scan_approved()
             _schedule_linkedin_post_if_due()
+            _schedule_facebook_post_if_due()
         except Exception:
             logger.exception("Error during orchestration cycle")
 
