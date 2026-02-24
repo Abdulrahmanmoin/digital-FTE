@@ -6,6 +6,16 @@
 
 ---
 
+## 📊 Top-line Metrics
+| Metric | Value |
+| :--- | :--- |
+| **Total Revenue** | $— |
+| **Overdue Amount** | $— |
+| **Weekly Actions** | 0 |
+| **Pending Approval** | 0 |
+
+---
+
 ## 📂 Operational Queues
 
 | Queue | Status | Link |
@@ -42,7 +52,13 @@
 
 ---
 
-## 📈 Recent Activity Log
+## 📈 Recent Reports
+- [[Reports/CEO_Briefing_2026-02-24|🏢 CEO Briefing (2026-02-24)]]
+- [[Reports/Audit_2026-02-23|🔍 Weekly Audit (2026-02-23)]]
+- [[Reports/Baseline_Report|📄 Baseline Performance Report]]
+- *Reports are generated hourly by the Reporting Engine.*
+
+## 📉 Recent Activity Log
 *No recent activity recorded in the dashboard.*
 
 ---

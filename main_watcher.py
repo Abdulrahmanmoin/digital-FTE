@@ -100,6 +100,22 @@ MANAGED_PROCESSES = [
         "max_rapid_restarts": 5,
         "rapid_window": 60,
     },
+    # Reporting & Analytics — periodic updates
+    {
+        "name": "reporting_engine",
+        "cmd": [sys.executable, str(BASE_DIR / "reporting_engine.py")],
+        "restart_delay": 60,
+        "max_rapid_restarts": 3,
+        "rapid_window": 300,
+    },
+    # CEO Daily Briefing
+    {
+        "name": "ceo_briefing",
+        "cmd": [sys.executable, str(BASE_DIR / "ceo_briefing.py")],
+        "restart_delay": 60,
+        "max_rapid_restarts": 3,
+        "rapid_window": 300,
+    },
 ]
 
 HEALTH_CHECK_INTERVAL = 10  # seconds between liveness checks
